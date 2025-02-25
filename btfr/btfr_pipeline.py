@@ -18,14 +18,14 @@ rcParams['font.family'] = 'serif'
 rcParams['font.serif'] = ['Computer Modern']
 rcParams['text.usetex'] = True
 
-N_AM_REALS = 10
-N_STELLAR_REALS = 1000
+N_AM_REALS = 1
+N_STELLAR_REALS = 2
 
 NU = -1.0
-ALPHA = -10.0
+ALPHA = -100
 SCATTER = 0.01
 X = 0.2
-HALO_SELECTION = True
+HALO_SELECTION = False
 
 M2L_DISK_MEAN = 0.5
 M2L_DISK_ERROR = 0.2

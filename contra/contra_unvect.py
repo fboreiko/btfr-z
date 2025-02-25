@@ -1,6 +1,12 @@
 import numpy as np
-from scipy.interpolate import CubicSpline
 from scipy.optimize import root_scalar
+import matplotlib.pyplot as plt
+from matplotlib import rcParams
+
+# Set the font to Computer Modern (LaTeX default) and enable LaTeX rendering
+rcParams['font.family'] = 'serif'
+rcParams['font.serif'] = ['Computer Modern']
+rcParams['text.usetex'] = True
 
 r0 = 0.03  # Rvir
 
@@ -97,8 +103,8 @@ def find_root(r, fb, rb, mhi, g, A, w):
         fprime=lambda r: wrapped_funcd(r)[1],
         x0=r,
         method='newton',
-        xtol=1e-6,
-        maxiter=10000
+        xtol=1e-10,  #-5
+        maxiter=10000 #1000
     )
 
     if result.converged:
@@ -124,4 +130,4 @@ def do_contra(ri, c, fb, rb, A, w):
         rad_f = find_root(ri[i], fb, rb, mhi_av[i], g[i], A, w)
         rf[i] = rad_f
 
-    return rf, mhi 
+    return rf, mhi

@@ -29,21 +29,32 @@ def halo_selection(matched_halos, x):
         that the halo was removed.
     """
     
-    nrows, ncols = matched_halos.shape
-    eliminate_mask = np.zeros((nrows, ncols), dtype=bool)
-    
-    for i in range(nrows):
+    if matched_halos.ndim == 1:
+        ncols = matched_halos.shape[0]
+        eliminate_mask = np.zeros(ncols, dtype=bool)
+
         n_remove = int(np.floor(x * ncols))
         
         if n_remove > 0:
-            row = matched_halos[i]
-            sorted_indices = np.argsort(row['vmax'])[::-1]
+            sorted_indices = np.argsort(matched_halos['vmax'])[::-1]
             remove_indices = sorted_indices[:n_remove]
-            eliminate_mask[i, remove_indices] = True
+            eliminate_mask[remove_indices] = True
+
+    else:
+        nrows, ncols = matched_halos.shape
+        eliminate_mask = np.zeros((nrows, ncols), dtype=bool)
+
+        for i in range(nrows):
+            n_remove = int(np.floor(x * ncols))
+            
+            if n_remove > 0:
+                row = matched_halos[i]
+                sorted_indices = np.argsort(row['vmax'])[::-1]
+                remove_indices = sorted_indices[:n_remove]
+                eliminate_mask[i, remove_indices] = True
     
     new_halos = matched_halos.copy()
-    new_halos[eliminate_mask] = np.zeros((), dtype=matched_halos.dtype)
-    
+    new_halos[eliminate_mask] = np.zeros(1, dtype=matched_halos.dtype)
     return new_halos, eliminate_mask
 
 
