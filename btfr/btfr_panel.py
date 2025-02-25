@@ -54,10 +54,10 @@ galaxy_sample = galaxy_sample[galaxy_sample['Galaxy'].isin(sparc_galaxy_list)]
 class SafeInterpolator:
     def __init__(self, interpolator):
         self.interpolator = interpolator
-        self.bounds = np.array([[0.01, 3],    #c range. Full range is [0, 3.9]
-                                [-3.3, -0.3], #fb range. Full range is [-3.6, -0.03]
-                                [-2.9, -1.3], #rb range. Full range is [-3, -1]
-                                [-4.8, 0.3]]) #rf range. Full range is [-4.8, 0.3]
+        self.bounds = np.array([[0, 3.9],    #full c range. Previously [0.01, 3]
+                                [-3.6, -0.03], #full fb range. Previously [-3.3, -0.3]
+                                [-3, -1], #full rb range. Previously [-2.9, -1.3]
+                                [-4.8, 0.3]]) #full rf range. Previously [-4.8, 0.3]
     def __call__(self, points):
         results = np.zeros(points.shape[0])  # Initialize results with zeros matching the number of input points
         valid_mask = np.all(
@@ -115,7 +115,7 @@ def forward_model_btfr(alpha, scatter, x, nu, vmaxshift=False):
     deconv = abundance_match.deconvoluted_catalogs(theta, halos)
 
     # Load contra interpolators
-    with open("/Users/fedorboreiko/Documents/Oxford/Personal_codes/Codebase/contra_emulators/contra_interpolators.pkl", "rb") as f:
+    with open("/Users/fedorboreiko/Documents/Oxford/Personal_codes/Codebase/contra_emulators/contra_interpolators_fullrange.pkl", "rb") as f:
         interpolators = pickle.load(f)
 
     if nu in interpolators:

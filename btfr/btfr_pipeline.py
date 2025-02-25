@@ -46,10 +46,10 @@ class SafeInterpolator:
     def __init__(self, interpolator):
         self.interpolator = interpolator
         # These bounds should be the same as the ones used to train the interpolator, adress the contra_emulator_trainer.py
-        self.bounds = np.array([[0.01, 3],    #c range. Full range is [0, 3.9]
-                                [-3.3, -0.3], #fb range. Full range is [-3.6, -0.03]
-                                [-2.9, -1.3], #rb range. Full range is [-3, -1]
-                                [-4.8, 0.3]]) #rf range. Full range is [-4.8, 0.3]
+        self.bounds = np.array([[0, 3.9],    #full c range. Previously [0.01, 3]
+                                [-3.6, -0.03], #full fb range. Previously [-3.3, -0.3]
+                                [-3, -1], #full rb range. Previously [-2.9, -1.3]
+                                [-4.8, 0.3]]) #full rf range. Previously [-4.8, 0.3]
     def __call__(self, points):
         results = np.zeros(points.shape[0])
         valid_mask = np.all(
@@ -206,7 +206,7 @@ if rank == 0:
     deconv = abundance_match.deconvoluted_catalogs(theta, halos)
 
     # Load contra interpolator
-    with open("/Users/fedorboreiko/Documents/Oxford/Personal_codes/Codebase/contra_emulators/contra_interpolators.pkl", "rb") as f:
+    with open("/Users/fedorboreiko/Documents/Oxford/Personal_codes/Codebase/contra_emulators/contra_interpolators_fullrange.pkl", "rb") as f:
         interpolators = pickle.load(f)
 
     if NU in interpolators:

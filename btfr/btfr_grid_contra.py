@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 from massfuncs import get_GSMF_ELPETRO
 from BAM import AbundanceMatch, proxies
-from btfr.btfr_utils import nfw_circular_velocity, nfw_circular_velocity_contra, get_loglike, halo_selection
+from btfr.btfr_utils import nfw_circular_velocity, nfw_circular_velocity_contra, get_loglike
 from tqdm import tqdm
 import os
 import pickle
@@ -38,10 +38,10 @@ class SafeInterpolator:
     def __init__(self, interpolator):
         self.interpolator = interpolator
         # These bounds should be the same as the ones used to train the interpolator, adress the contra_emulator_trainer.py
-        self.bounds = np.array([[0.01, 3],    #c range. Full range is [0, 3.9]
-                                [-3.3, -0.3], #fb range. Full range is [-3.6, -0.03]
-                                [-2.9, -1.3], #rb range. Full range is [-3, -1]
-                                [-4.8, 0.3]]) #rf range. Full range is [-4.8, 0.3]
+        self.bounds = np.array([[0, 3.9],    #full c range. Previously [0.01, 3]
+                                [-3.6, -0.03], #full fb range. Previously [-3.3, -0.3]
+                                [-3, -1], #full rb range. Previously [-2.9, -1.3]
+                                [-4.8, 0.3]]) #full rf range. Previously [-4.8, 0.3]
     def __call__(self, points):
         results = np.zeros(points.shape[0])
         valid_mask = np.all(
@@ -82,8 +82,7 @@ def load_data():
 
 
 def compute_AM_realization(AM_object, deconv, emulator, nu_value, galaxy_sample, mass_model_catalog, halo_catalog, Luminosities_bulge, 
-                           Luminosities_36, Luminosity_36_errs, Eff_rads, MH1_means, MH1_errors, distances, distances_err, x_value,
-                           Halo_selection_mode=False):
+                           Luminosities_36, Luminosity_36_errs, Eff_rads, MH1_means, MH1_errors, distances, distances_err, x_value):
 
     # Add scatter to the deconvoluted catalog, and return the catalog of stellar masses matched to halos from the halo catalog
     mask, catalog_sc = AM_object.add_scatter(deconv, cut_range=(3, 12), return_catalog=True)
@@ -113,15 +112,6 @@ def compute_AM_realization(AM_object, deconv, emulator, nu_value, galaxy_sample,
     indices = sorted_indices[indices_sorted].reshape(len(galaxy_sample), N_STELLAR_REALS)
 
     matched_halos = halo_catalog[indices]
-
-    # Halo selection
-    if Halo_selection_mode:
-        matched_halos, elliminate_masks = halo_selection(matched_halos, x_value)
-
-        M_star_samples[elliminate_masks] = 0
-        MH1_samples[elliminate_masks] = 0
-        M2L_disk_samples[elliminate_masks] = 0
-        M2L_bulge_samples[elliminate_masks] = 0
 
     # Simulate the rotation curves
     vels = np.empty((len(galaxy_sample), N_STELLAR_REALS))
@@ -169,7 +159,7 @@ def compute_AM_realization(AM_object, deconv, emulator, nu_value, galaxy_sample,
 
 def compute_likelihood(alpha_value, scatter_value, x_value, AM_object, emulator, nu_value, galaxy_sample, mass_model_catalog, sparc_catalog, halo_catalog, 
                        Luminosity_bulge, Luminosity_36, Luminosity_36_errs, Eff_radii, MH1_means, MH1_errors, distances, distances_err,
-                       Halo_selection_mode=False, Vmax_shift_mode=False):
+                       Vmax_shift_mode=False):
 
     theta = {"alpha": alpha_value, "scatter": scatter_value}
     deconv = AM_object.deconvoluted_catalogs(theta, halo_catalog)
@@ -185,7 +175,7 @@ def compute_likelihood(alpha_value, scatter_value, x_value, AM_object, emulator,
 
         vels = compute_AM_realization(AM_object, deconv, emulator, nu_value, galaxy_sample, mass_model_catalog, halo_catalog,
                                       Luminosity_bulge, Luminosity_36, Luminosity_36_errs, Eff_radii, MH1_means,
-                                      MH1_errors, distances, distances_err, x_value, Halo_selection_mode)
+                                      MH1_errors, distances, distances_err, x_value)
 
         local_vels[i, :, :] = vels
 
@@ -231,7 +221,7 @@ if __name__ == "__main__":
     galaxy_list, bulge_lumins_dict, galaxy_data_dict, mass_models, sparc_btfr = load_data()
     
     # Load contra interpolators
-    with open("/Users/fedorboreiko/Documents/Oxford/Personal_codes/Codebase/contra_emulators/contra_interpolators.pkl", "rb") as f:
+    with open("/Users/fedorboreiko/Documents/Oxford/Personal_codes/Codebase/contra_emulators/contra_interpolators_fullrange.pkl", "rb") as f:
         interpolators = pickle.load(f)
 
     # Extracting the data for the galaxies in the SPARC sample in the form of 2d array for vectorized calculations.
@@ -259,7 +249,6 @@ if __name__ == "__main__":
     scatter_range = np.array([0.1])   #np.linspace(0.01, 1, 31)
     x_range = np.linspace(0.0, 1.0, 500)
     nu_range = np.array([-1.0])   #np.round(np.linspace(-3.0, 3.0, 31), 1)
-    Halo_selection_mode = True
     Vmax_shift_mode = False
 
     if rank == 0:
@@ -298,7 +287,7 @@ if __name__ == "__main__":
 
                     likelihood = compute_likelihood(alpha, scatter, x, abundance_match, interpolator, nu, galaxy_list, mass_models, sparc_btfr, 
                                                     halos, L_bulges, L_36_means, L_36_errors, Eff_radii, MH1_means, MH1_errors, dists, dists_err,
-                                                    Halo_selection_mode, Vmax_shift_mode)
+                                                    Vmax_shift_mode)
 
                     if likelihood is not None:
                         likelihood_grid[i, j, k, f] = likelihood
@@ -307,15 +296,9 @@ if __name__ == "__main__":
     if rank == 0:
         pbar.close()
 
-        if Halo_selection_mode:
-            if Vmax_shift_mode:
-                np.save(f'likelihood_grid_{N_AM_REALS}am_{N_STELLAR_REALS}stellar_alphaproxy_{np.min(alpha_proxy_range)}_{np.max(alpha_proxy_range)}_scatter_{np.min(scatter_range)}_{np.max(scatter_range)}_x_{np.min(x_range)}_{np.max(x_range)}_nu_{np.min(nu_range)}_{np.max(nu_range)}_vmaxshift.npy', likelihood_grid)
-            else:
-                np.save(f'likelihood_grid_{N_AM_REALS}am_{N_STELLAR_REALS}stellar_alphaproxy_{np.min(alpha_proxy_range)}_{np.max(alpha_proxy_range)}_scatter_{np.min(scatter_range)}_{np.max(scatter_range)}_x_{np.min(x_range)}_{np.max(x_range)}_nu_{np.min(nu_range)}_{np.max(nu_range)}.npy', likelihood_grid)
+        if Vmax_shift_mode:
+            np.save(f'likelihood_grid_{N_AM_REALS}am_{N_STELLAR_REALS}stellar_alphaproxy_{np.min(alpha_proxy_range)}_{np.max(alpha_proxy_range)}_scatter_{np.min(scatter_range)}_{np.max(scatter_range)}_nu_{np.min(nu_range)}_{np.max(nu_range)}_vmaxshift.npy', likelihood_grid)
         else:
-            if Vmax_shift_mode:
-                np.save(f'likelihood_grid_{N_AM_REALS}am_{N_STELLAR_REALS}stellar_alphaproxy_{np.min(alpha_proxy_range)}_{np.max(alpha_proxy_range)}_scatter_{np.min(scatter_range)}_{np.max(scatter_range)}_nu_{np.min(nu_range)}_{np.max(nu_range)}_vmaxshift.npy', likelihood_grid)
-            else:
-                np.save(f'likelihood_grid_{N_AM_REALS}am_{N_STELLAR_REALS}stellar_alphaproxy_{np.min(alpha_proxy_range)}_{np.max(alpha_proxy_range)}_scatter_{np.min(scatter_range)}_{np.max(scatter_range)}_nu_{np.min(nu_range)}_{np.max(nu_range)}.npy', likelihood_grid)
+            np.save(f'likelihood_grid_{N_AM_REALS}am_{N_STELLAR_REALS}stellar_alphaproxy_{np.min(alpha_proxy_range)}_{np.max(alpha_proxy_range)}_scatter_{np.min(scatter_range)}_{np.max(scatter_range)}_nu_{np.min(nu_range)}_{np.max(nu_range)}.npy', likelihood_grid)
 
         print("Likelihood grid computation complete!")

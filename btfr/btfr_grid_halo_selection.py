@@ -39,10 +39,10 @@ class SafeInterpolator:
     def __init__(self, interpolator):
         self.interpolator = interpolator
         # These bounds should be the same as the ones used to train the interpolator, adress the contra_emulator_trainer.py
-        self.bounds = np.array([[0.01, 3],    #c range. Full range is [0, 3.9]
-                                [-3.3, -0.3], #fb range. Full range is [-3.6, -0.08]
-                                [-2.9, -1.3], #rb range. Full range is [-3, -1]
-                                [-4.8, 0.3]]) #rf range. Full range is [-4.8, 0.3]
+        self.bounds = np.array([[0, 3.9],    #full c range. Previously [0.01, 3]
+                                [-3.6, -0.03], #full fb range. Previously [-3.3, -0.3]
+                                [-3, -1], #full rb range. Previously [-2.9, -1.3]
+                                [-4.8, 0.3]]) #full rf range. Previously [-4.8, 0.3]
     def __call__(self, points):
         results = np.zeros(points.shape[0])
         valid_mask = np.all(
@@ -200,12 +200,6 @@ def compute_likelihood(alpha_value, scatter_value, AM_object, emulator, nu_value
 
         V_mocks_unlogged = [row[row != 0] for row in gathered_vels_reshaped.reshape(len(galaxy_sample), -1)]
 
-        # Print the percentages
-        #original_length = N_AM_REALS * N_STELLAR_REALS
-        #filtered_lengths = [len(row) for row in V_mocks_unlogged]
-        #print("Percentage of original array length retained after filtering out-of-bound points (per galaxy):")
-        #print([round((length / original_length) * 100, 2) for length in filtered_lengths])
-
         V_mocks = [np.log10(row) for row in V_mocks_unlogged]
 
         V_obs_unlogged = np.array(sparc_catalog['Vmax'])
@@ -233,7 +227,7 @@ if __name__ == "__main__":
     galaxy_list, bulge_lumins_dict, galaxy_data_dict, mass_models, sparc_btfr = load_data()
     
     # Load contra interpolators
-    with open("/Users/fedorboreiko/Documents/Oxford/Personal_codes/Codebase/contra_emulators/clever_interpolators_20.pkl", "rb") as f:
+    with open("/Users/fedorboreiko/Documents/Oxford/Personal_codes/Codebase/contra_emulators/contra_interpolators_fullrange.pkl", "rb") as f:
         interpolators = pickle.load(f)
 
     # Extracting the data for the galaxies in the SPARC sample in the form of 2d array for vectorized calculations.
@@ -251,7 +245,7 @@ if __name__ == "__main__":
     halos = np.load("/Users/fedorboreiko/Documents/Oxford/Personal_codes/Codebase/halos_z_0p00.npy")
 
     # Create abundance matching (AM) object
-    proxy = proxies["mvir_proxy"]()
+    proxy = proxies["mvir_proxy"](use_cache=False)
     abundance_match = AbundanceMatch(log_stellar_masses[10:], SMF_data[10:], halo_proxy=proxy, ext_range=(3.0, 12.0),
                                     boxsize=140, faint_end_first=True, scatter_mult=1, faint_end_slope=-0.42)
 
