@@ -19,18 +19,17 @@ rcParams['font.serif'] = ['Computer Modern']
 rcParams['text.usetex'] = True
 
 N_AM_REALS = 10
-N_STELLAR_REALS = 500
+N_STELLAR_REALS = 1000
 
-SCATTER_1 = 0.18
-ALPHA_1 = -10
+SCATTER_1 = 0.01
+ALPHA_1 = -1000
 X_1 = 0.0
-NU_1 = 0.0
-SCATTER_2 = 0.18
-ALPHA_2 = -10
-X_2 = 0.45
-NU_2 = 0.0
-VMAXSHIFT = True
-HALOSELECTION = True
+NU_1 = np.linspace(-3.0, 3.0, 20)[5]
+SCATTER_2 = 0.08
+ALPHA_2 = -1000
+X_2 = 0.08
+NU_2 = np.linspace(-3.0, 3.0, 20)[12]
+VMAXSHIFT = False
 
 M2L_DISK_MEAN = 0.5
 M2L_DISK_ERROR = 0.2 # dex
@@ -98,7 +97,7 @@ def load_data(galaxy):
 
 def forward_model_btfr(alpha, scatter, x, nu, vmaxshift=False):
 
-    print(f'\nRunning forward model with alpha={alpha}, scatter={scatter}, nu={nu}...')
+    print(f'\nRunning forward model with alpha={alpha}, scatter={scatter}, x={x}, nu={nu}...')
 
     # Load the N.Adams SMF data
     log_stellar_masses, SMF_data, _ = get_GSMF_ELPETRO(plotting=False)
@@ -106,13 +105,18 @@ def forward_model_btfr(alpha, scatter, x, nu, vmaxshift=False):
     # Load the Uchuu halos 
     halos = np.load("/Users/fedorboreiko/Documents/Oxford/Personal_codes/Codebase/halos_z_0p00.npy")
 
-    proxy = proxies["mvir_proxy"]()
+    n_remove = int(np.floor(x * halos.shape[0]))
+    sorted_indices = np.argsort(halos['vmax'])[::-1]
+    remove_indices = sorted_indices[:n_remove]
+    halos_selected = np.delete(halos, remove_indices)
+
+    proxy = proxies["mvir_proxy"](use_cache=False)
 
     abundance_match = AbundanceMatch(log_stellar_masses[10:], SMF_data[10:], halo_proxy=proxy, ext_range=(3.0, 12.0),
                                         boxsize=140, faint_end_first=True, scatter_mult=1, faint_end_slope=-0.42)
     
     theta = {"alpha": alpha, "scatter": scatter}  # Will be tuned?
-    deconv = abundance_match.deconvoluted_catalogs(theta, halos)
+    deconv = abundance_match.deconvoluted_catalogs(theta, halos_selected)
 
     # Load contra interpolators
     with open("/Users/fedorboreiko/Documents/Oxford/Personal_codes/Codebase/contra_emulators/contra_interpolators_fullrange.pkl", "rb") as f:
@@ -132,7 +136,7 @@ def forward_model_btfr(alpha, scatter, x, nu, vmaxshift=False):
 
         mask, catalog_sc = abundance_match.add_scatter(deconv, cut_range=(3, 12), return_catalog=True)
 
-        halo_proxy = np.log10(halos['Mvir'])[mask]
+        halo_proxy = np.log10(halos_selected['Mvir'])[mask]
 
         # Sort catalog_sc and get the sorting indices
         sorted_indices = np.argsort(catalog_sc)
@@ -167,16 +171,7 @@ def forward_model_btfr(alpha, scatter, x, nu, vmaxshift=False):
             # Map the sorted indices back to the original indices
             indices = sorted_indices[indices_sorted]
 
-            matched_halos = halos[indices]
-
-            if HALOSELECTION:
-
-                matched_halos, elliminate_masks = halo_selection(matched_halos, x)
-
-                M_star_samples[elliminate_masks] = 0
-                MH1_samples[elliminate_masks] = 0
-                M2L_disk_samples[elliminate_masks] = 0
-                M2L_bulge_samples[elliminate_masks] = 0
+            matched_halos = halos_selected[indices]
 
             Mvir = matched_halos['Mvir'] / 0.7
             Rvir = matched_halos['Rvir'] / 0.7
@@ -348,21 +343,21 @@ fig, axs = plt.subplots(3, 2, figsize=(14, 15))
 V_mock_1, V_mock_err_1, M_mock_1, M_mock_err_1, V_obs_1, V_obs_err_1, M_obs_1, M_obs_err_1, halo_proxy_1, catalog_1, residuals_1, log_likelihood_1, log_likelihoods_1 = forward_model_btfr(alpha=ALPHA_1, scatter=SCATTER_1, x=X_1, nu=NU_1, vmaxshift=VMAXSHIFT)
 btfr_plot(M_mock_1, V_mock_1, M_mock_err_1, V_mock_err_1, M_obs_1, V_obs_1, M_obs_err_1, V_obs_err_1, axs[0, 0])
 if VMAXSHIFT:
-    axs[0, 0].set_title(fr'BTFR with $\alpha={ALPHA_1}$, $\sigma={SCATTER_1}$, x={X_1}, $\nu={NU_1}$, Vmax shift, Loglike {log_likelihood_1:.2f}', fontsize=16)
+    axs[0, 0].set_title(fr'BTFR with $\alpha={ALPHA_1}$, $\sigma={SCATTER_1}$, x={X_1}, $\nu={NU_1:.2f}$, VS, Loglike {log_likelihood_1:.2f}', fontsize=16)
 else:
-    axs[0, 0].set_title(fr'BTFR with $\alpha={ALPHA_1}$, $\sigma={SCATTER_1}$, x={X_1}, $\nu={NU_1}$, Loglike {log_likelihood_1:.2f}', fontsize=16)
+    axs[0, 0].set_title(fr'BTFR with $\alpha={ALPHA_1}$, $\sigma={SCATTER_1}$, x={X_1}, $\nu={NU_1:.2f}$, Loglike {log_likelihood_1:.2f}', fontsize=16)
 
 # Plot for alpha2, scatter2, nu2
 V_mock_2, V_mock_err_2, M_mock_2, M_mock_err_2, V_obs_2, V_obs_err_2, M_obs_2, M_obs_err_2, halo_proxy_2, catalog_2, residuals_2, log_likelihood_2, log_likelihoods_2 = forward_model_btfr(alpha=ALPHA_2, scatter=SCATTER_2, x=X_2, nu=NU_2, vmaxshift=VMAXSHIFT)
 btfr_plot(M_mock_2, V_mock_2, M_mock_err_2, V_mock_err_2, M_obs_2, V_obs_2, M_obs_err_2, V_obs_err_2, axs[0, 1])
 if VMAXSHIFT:
-    axs[0, 1].set_title(fr'BTFR with $\alpha={ALPHA_2}$, $\sigma={SCATTER_2}$, x={X_2}, $\nu={NU_2}$, Vmax shift, Loglike {log_likelihood_2:.2f}', fontsize=16)
+    axs[0, 1].set_title(fr'BTFR with $\alpha={ALPHA_2}$, $\sigma={SCATTER_2}$, x={X_2}, $\nu={NU_2:.2f}$, VS, Loglike {log_likelihood_2:.2f}', fontsize=16)
 else:
-    axs[0, 1].set_title(fr'BTFR with $\alpha={ALPHA_2}$, $\sigma={SCATTER_2}$, x={X_2}, $\nu={NU_2}$, Loglike {log_likelihood_2:.2f}', fontsize=16)
+    axs[0, 1].set_title(fr'BTFR with $\alpha={ALPHA_2}$, $\sigma={SCATTER_2}$, x={X_2}, $\nu={NU_2:.2f}$, Loglike {log_likelihood_2:.2f}', fontsize=16)
 
 # SHMR Plot
-plot_SHMR_with_contours_quantile(axs[1, 0], halo_proxy_1, catalog_1, color='purple', label=fr'$\alpha={ALPHA_1}$, $\sigma={SCATTER_1}$, x={X_1}, $\nu={NU_1}$')
-plot_SHMR_with_contours_quantile(axs[1, 0], halo_proxy_2, catalog_2, color='orange', label=fr'$\alpha={ALPHA_2}$, $\sigma={SCATTER_2}$, x={X_2}, $\nu={NU_2}$')
+plot_SHMR_with_contours_quantile(axs[1, 0], halo_proxy_1, catalog_1, color='purple', label=fr'$\alpha={ALPHA_1}$, $\sigma={SCATTER_1}$, x={X_1}, $\nu={NU_1:.2f}$')
+plot_SHMR_with_contours_quantile(axs[1, 0], halo_proxy_2, catalog_2, color='orange', label=fr'$\alpha={ALPHA_2}$, $\sigma={SCATTER_2}$, x={X_2}, $\nu={NU_2:.2f}$')
 axs[1, 0].set_ylabel(r'$\log_{10}(M_*/M_h)$', fontsize=12) 
 axs[1, 0].set_xlabel(r'$\log_{10}(M_h (M_\odot))$', fontsize=12) 
 axs[1, 0].set_title("Stellar-to-Halo Mass Relations", fontsize=16)
@@ -371,8 +366,8 @@ axs[1, 0].set_ylim([7, 12])
 axs[1, 0].legend()
 
 # Plot Residuals vs Mmocks
-scatter_residuals_vs_mocks(axs[1, 1], M_mock_1, residuals_1, color='purple', label=fr'$\alpha={ALPHA_1}$, $\sigma={SCATTER_1}$, x={X_1}, $\nu={NU_1}$')
-scatter_residuals_vs_mocks(axs[1, 1], M_mock_2, residuals_2, color='orange', label=fr'$\alpha={ALPHA_2}$, $\sigma={SCATTER_2}$, x={X_2}, $\nu={NU_2}$')
+scatter_residuals_vs_mocks(axs[1, 1], M_mock_1, residuals_1, color='purple', label=fr'$\alpha={ALPHA_1}$, $\sigma={SCATTER_1}$, x={X_1}, $\nu={NU_1:.2f}$')
+scatter_residuals_vs_mocks(axs[1, 1], M_mock_2, residuals_2, color='orange', label=fr'$\alpha={ALPHA_2}$, $\sigma={SCATTER_2}$, x={X_2}, $\nu={NU_2:.2f}$')
 
 # Plot Loglikes vs Mocks
 delta_loglike = log_likelihoods_2 - log_likelihoods_1

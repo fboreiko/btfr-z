@@ -5,7 +5,7 @@ xlabel = r'$\log_{10} \left( \frac{V_{\rm max}}{{\rm km \, s^{-1}}} \right)$'
 ylabel = r'$\log_{10} \left( \frac{M_{\rm bar}}{{\rm \, M_{\odot}}} \right)$'
 
 
-def btfr_plot(xmock, ymock, xmockerr, ymockerr, xobs, yobs, xobserr, yobserr, plotname):
+def btfr_plot(loglike, xmock, ymock, xmockerr, ymockerr, xobs, yobs, xobserr, yobserr, plotname):
 
     fig, ax = plt.subplots()
     ax.errorbar(xmock, ymock, xerr=xmockerr, yerr=ymockerr, fmt='o',
@@ -16,7 +16,7 @@ def btfr_plot(xmock, ymock, xmockerr, ymockerr, xobs, yobs, xobserr, yobserr, pl
             capthick=0.5, ecolor='black', label='Obs data')
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
-    ax.set_title('Tully-Fisher Relation')
+    ax.set_title(f'BTFR, Log Likelihood: {loglike:.3g}')
     ax.set_xlim([1, 3])
     ax.set_ylim([7, 12])
     ax.legend()

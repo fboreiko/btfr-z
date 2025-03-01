@@ -14,7 +14,7 @@ def GSMF(M_star, alp_1, alp_2, phi_1, phi_2, char_M_star):
 
     return GSMF
 
-def get_GSMF_Adams(redshift=0, plotting=True):
+def get_GSMF_Adams(redshift=0, plotting=False):
     # obtains SMF from N.Adams paper for a given redshift 
 
     log_char_m_star = 10.88

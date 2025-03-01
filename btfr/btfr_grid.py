@@ -10,10 +10,8 @@ from massfuncs import get_GSMF_ELPETRO
 from BAM import AbundanceMatch, proxies
 from btfr.btfr_utils import nfw_circular_velocity, nfw_circular_velocity_contra, get_loglike
 from tqdm import tqdm
-import os
 import pickle
-import re
-import h5py
+import time
 
 N_AM_REALS = 10
 N_STELLAR_REALS = 1000
@@ -57,12 +55,12 @@ class SafeInterpolator:
 
 
 def load_data():
-
-    # Loading and preparing the data. Could be modified to load NSA stellar masses from backup_sparcx.csv, then cut
-    # off the galaxies from SPARC that are not in the NSA data. Here, we load the data and cut it to match SPARC 
-    # sample only. It was found that Sersic masses match SPARC masses within 0.2 dex, so we can continue using 
-    # SPARC while adding more scatter to M2L ratios.
-
+    """
+    Loading and preparing the data. Could be modified to load NSA stellar masses from backup_sparcx.csv, then cut
+    off the galaxies from SPARC that are not in the NSA data. Here, we load the data and cut it to match SPARC 
+    sample only. It was found that Sersic masses match SPARC masses within 0.2 dex, so we can continue using 
+    SPARC while adding more scatter to M2L ratios.
+    """
     bulge_lumins = pd.read_csv('Tabular_data/Bulge_lum_table.csv')
     mass_models = pd.read_csv('Tabular_data/Mass_models_table.csv')
     galaxy_sample = pd.read_csv('Tabular_data/Gal_sample_table.csv')
@@ -79,13 +77,15 @@ def load_data():
     galaxy_data_dict = galaxy_sample.set_index('Galaxy').to_dict('index')
     
     return sparc_galaxy_list, bulge_lumins_dict, galaxy_data_dict, mass_models, sparc_btfr
-
-
-def compute_AM_realization(AM_object, deconv, emulator, nu_value, galaxy_sample, mass_model_catalog, halo_catalog, Luminosities_bulge, 
-                           Luminosities_36, Luminosity_36_errs, Eff_rads, MH1_means, MH1_errors, distances, distances_err, x_value):
+    
+def compute_AM_realization(abundance_match, deconv, nu_value, emulator, galaxy_sample, mass_model_catalog, halo_catalog, 
+                           Luminosities_bulge, Luminosities_36, Luminosity_36_errs, Eff_rads, MH1_means, MH1_errors, 
+                           distances, distances_err):
+    
+    am_start_time = time.time()
 
     # Add scatter to the deconvoluted catalog, and return the catalog of stellar masses matched to halos from the halo catalog
-    mask, catalog_sc = AM_object.add_scatter(deconv, cut_range=(3, 12), return_catalog=True)
+    mask, catalog_sc = abundance_match.add_scatter(deconv, cut_range=(3, 12), return_catalog=True)
 
     # Sort the catalog and extract the sorted indices
     sorted_indices = np.argsort(catalog_sc)
@@ -112,6 +112,9 @@ def compute_AM_realization(AM_object, deconv, emulator, nu_value, galaxy_sample,
     indices = sorted_indices[indices_sorted].reshape(len(galaxy_sample), N_STELLAR_REALS)
 
     matched_halos = halo_catalog[indices]
+
+    matching_time = time.time() - am_start_time
+    print(f"Matching time: {matching_time} s")
 
     # Simulate the rotation curves
     vels = np.empty((len(galaxy_sample), N_STELLAR_REALS))
@@ -154,15 +157,17 @@ def compute_AM_realization(AM_object, deconv, emulator, nu_value, galaxy_sample,
 
         vels[j, :] = V_max
 
+    rc_time = time.time() - am_start_time - matching_time
+    print(f"Rotation curve time: {rc_time} s")
     return vels
 
 
-def compute_likelihood(alpha_value, scatter_value, x_value, AM_object, emulator, nu_value, galaxy_sample, mass_model_catalog, sparc_catalog, halo_catalog, 
-                       Luminosity_bulge, Luminosity_36, Luminosity_36_errs, Eff_radii, MH1_means, MH1_errors, distances, distances_err,
-                       Vmax_shift_mode=False):
+def compute_likelihood(alpha_value, scatter_value, nu_value, abundance_match, emulator, galaxy_sample, mass_model_catalog, 
+                       sparc_catalog, halo_catalog, Luminosity_bulge, Luminosity_36, Luminosity_36_errs, Eff_radii, MH1_means, 
+                       MH1_errors, distances, distances_err, Vmax_shift_mode=False):
 
     theta = {"alpha": alpha_value, "scatter": scatter_value}
-    deconv = AM_object.deconvoluted_catalogs(theta, halo_catalog)
+    deconv = abundance_match.deconvoluted_catalogs(theta, halo_catalog)
 
     # Split the realizations across processes
     realizations_per_process = np.array_split(np.arange(N_AM_REALS), size)
@@ -173,9 +178,9 @@ def compute_likelihood(alpha_value, scatter_value, x_value, AM_object, emulator,
 
     for i, realization in enumerate(local_realizations):
 
-        vels = compute_AM_realization(AM_object, deconv, emulator, nu_value, galaxy_sample, mass_model_catalog, halo_catalog,
-                                      Luminosity_bulge, Luminosity_36, Luminosity_36_errs, Eff_radii, MH1_means,
-                                      MH1_errors, distances, distances_err, x_value)
+        vels = compute_AM_realization(abundance_match, deconv, nu_value, emulator, galaxy_sample, mass_model_catalog, 
+                                      halo_catalog,Luminosity_bulge, Luminosity_36, Luminosity_36_errs, Eff_radii, 
+                                      MH1_means, MH1_errors, distances, distances_err)
 
         local_vels[i, :, :] = vels
 
@@ -239,16 +244,16 @@ if __name__ == "__main__":
     halos = np.load("/Users/fedorboreiko/Documents/Oxford/Personal_codes/Codebase/halos_z_0p00.npy")
 
     # Create abundance matching (AM) object
-    proxy = proxies["mvir_proxy"]()
+    proxy = proxies["mvir_proxy"](use_cache=False)
     abundance_match = AbundanceMatch(log_stellar_masses[10:], SMF_data[10:], halo_proxy=proxy, ext_range=(3.0, 12.0),
                                      boxsize=140, faint_end_first=True, scatter_mult=1, faint_end_slope=-0.42)
     
     # Define ranges for alpha, scatter, nu and the mode (Vmax shift or not)
-    alpha_proxy_range = np.array([-0.4])  #np.linspace(-np.pi / 2, 0, 31)
+    alpha_proxy_range = np.linspace(-np.pi / 2, 0, 20)
     alpha_range = np.tan(alpha_proxy_range)
-    scatter_range = np.array([0.1])   #np.linspace(0.01, 1, 31)
-    x_range = np.linspace(0.0, 1.0, 500)
-    nu_range = np.array([-1.0])   #np.round(np.linspace(-3.0, 3.0, 31), 1)
+    scatter_range = np.linspace(0.01, 0.6, 10)
+    x_range = np.linspace(0.0, 0.5, 10)
+    nu_range = np.linspace(-3.0, 3.0, 20)
     Vmax_shift_mode = False
 
     if rank == 0:
@@ -271,26 +276,33 @@ if __name__ == "__main__":
         total_calculations = len(alpha_range) * len(scatter_range) * len(x_range) * len(nu_range)
         pbar = tqdm(total=total_calculations, desc="Grid Points Evaluated", position=0, leave=True)
 
-    # Compute likelihood for each combination of alpha and scatter
-    for i, alpha in enumerate(alpha_range):
+    for i, x in enumerate(x_range):
 
-        for j, scatter in enumerate(scatter_range):
+        # Implement halo selection on the halo catalog: cut off the fraction of x * 100% of halos starting
+        # from the highest Vmax values
+        n_remove = int(np.floor(x * halos.shape[0]))
+        sorted_indices = np.argsort(halos['vmax'])[::-1]
+        remove_indices = sorted_indices[:n_remove]
+        halos_selected = np.delete(halos, remove_indices)
 
-            for k, x in enumerate(x_range):
+        for j, nu in enumerate(nu_range):
 
-                for f, nu in enumerate(nu_range):
+            if nu in interpolators:
+                interpolator = SafeInterpolator(interpolators[nu])
+            else:
+                raise ValueError(f"Interpolator for nu={nu} not found.")
 
-                    if nu in interpolators:
-                        interpolator = SafeInterpolator(interpolators[nu])
-                    else:
-                        raise ValueError(f"Interpolator for nu={nu} not found.")
+            # Compute likelihood for each combination of alpha, scatter, and nu
+            for k, alpha in enumerate(alpha_range):
 
-                    likelihood = compute_likelihood(alpha, scatter, x, abundance_match, interpolator, nu, galaxy_list, mass_models, sparc_btfr, 
-                                                    halos, L_bulges, L_36_means, L_36_errors, Eff_radii, MH1_means, MH1_errors, dists, dists_err,
+                for f, scatter in enumerate(scatter_range):
+
+                    likelihood = compute_likelihood(alpha, scatter, nu, abundance_match, interpolator, galaxy_list, mass_models, sparc_btfr, 
+                                                    halos_selected, L_bulges, L_36_means, L_36_errors, Eff_radii, MH1_means, MH1_errors, dists, dists_err,
                                                     Vmax_shift_mode)
 
                     if likelihood is not None:
-                        likelihood_grid[i, j, k, f] = likelihood
+                        likelihood_grid[k, f, i, j] = likelihood
                         pbar.update(1)
 
     if rank == 0:

@@ -9,23 +9,29 @@ import pandas as pd
 from btfr.massfuncs import get_GSMF_ELPETRO
 from BAM import AbundanceMatch, proxies
 from btfr.btfr_plotting import btfr_plot, explore_hist
-from btfr.btfr_utils import halo_selection, nfw_circular_velocity_contra, nfw_circular_velocity, get_loglike
+from btfr.btfr_utils import nfw_circular_velocity_contra, nfw_circular_velocity, get_loglike
 from matplotlib import rcParams
 from tqdm import tqdm
 import pickle
+import time
+import jax
+import jax.numpy as jnp
+from jax.scipy.ndimage import map_coordinates
+from functools import partial
+
+jax.config.update("jax_enable_x64", True)
 
 rcParams['font.family'] = 'serif'
 rcParams['font.serif'] = ['Computer Modern']
 rcParams['text.usetex'] = True
 
-N_AM_REALS = 1
-N_STELLAR_REALS = 2
+N_AM_REALS = 10
+N_STELLAR_REALS = 1000
 
-NU = -1.0
-ALPHA = -100
-SCATTER = 0.01
-X = 0.2
-HALO_SELECTION = False
+ALPHA = -1000
+SCATTER = 0.1
+X = 0.6
+NU = np.linspace(-3.0, 3.0, 20)[2]
 
 M2L_DISK_MEAN = 0.5
 M2L_DISK_ERROR = 0.2
@@ -40,32 +46,34 @@ size = comm.Get_size()
 
 if rank == 0:
     print('Number of processes:', size)
+    print(f'Model parameters: alpha = {ALPHA}, scatter = {SCATTER}, x = {X}, nu = {NU}')
 
-# Wrapper class around original interpolator, handles out-of-bounds inputs by returning zeros in these cases
-class SafeInterpolator:
-    def __init__(self, interpolator):
-        self.interpolator = interpolator
-        # These bounds should be the same as the ones used to train the interpolator, adress the contra_emulator_trainer.py
-        self.bounds = np.array([[0, 3.9],    #full c range. Previously [0.01, 3]
-                                [-3.6, -0.03], #full fb range. Previously [-3.3, -0.3]
-                                [-3, -1], #full rb range. Previously [-2.9, -1.3]
-                                [-4.8, 0.3]]) #full rf range. Previously [-4.8, 0.3]
-    def __call__(self, points):
-        results = np.zeros(points.shape[0])
-        valid_mask = np.all(
-            (points >= self.bounds[:, 0]) & (points <= self.bounds[:, 1]), axis=1
-        )
-        valid_points = points[valid_mask]
+@partial(jax.jit, static_argnames=("order",))
+def jax_contra_interpolator(grid, positions, grid_axes, order=1):
+    """
+    A thin wrapper that converts the grid and query points into JAX arrays,
+    performs interpolation, and applies a validity mask to handle out-of-bounds points.
+    """
+    indices = []
+    valid_mask = jnp.ones(positions.shape[0], dtype=bool)  # Start with all points valid
+    for i in range(positions.shape[1]):
+        axis = grid_axes[i]
+        grid_min = axis[0]
+        grid_max = axis[-1]
+        n_points = axis.shape[0]
+        index_coord = (positions[:, i] - grid_min) / (grid_max - grid_min) * (n_points - 1)
+        valid_mask &= (positions[:, i] >= grid_min) & (positions[:, i] <= grid_max)
+        indices.append(index_coord)
 
-        if valid_points.size > 0:
-            valid_results = self.interpolator(valid_points)
-            results[valid_mask] = valid_results
-
-        return results
+    coords = jnp.stack(indices, axis=0)  # shape: (dimensions, n_points)
+    interpolated_values = map_coordinates(grid, coords, order=order, mode='constant', cval=0)
+    return interpolated_values * valid_mask
 
 def compute_AM_realization(abundance_match, deconv, sparc_galaxy_list, mass_models, halos, 
                            L_bulges, L_36_means, L_36_errors, Eff_rads, MH1_means, MH1_errors, 
                            dists, dists_err, emulator):
+    
+    am_start_time = time.time()
     
     # Add scatter to the deconvoluted catalog, and return the catalog of stellar masses matched to halos from the halo catalog
     mask, catalog_sc = abundance_match.add_scatter(deconv, cut_range=(3, 12), return_catalog=True)
@@ -96,14 +104,8 @@ def compute_AM_realization(abundance_match, deconv, sparc_galaxy_list, mass_mode
 
     matched_halos = halos[indices]
 
-    # Halo selection
-    if HALO_SELECTION:
-        matched_halos, elliminate_masks = halo_selection(matched_halos, X)
-
-        M_star_samples[elliminate_masks] = 0
-        MH1_samples[elliminate_masks] = 0
-        M2L_disk_samples[elliminate_masks] = 0
-        M2L_bulge_samples[elliminate_masks] = 0
+    matching_time = time.time() - am_start_time
+    print(f"Matching time: {matching_time} s")
 
     # Simulate the rotation curves
     vels = np.empty((len(sparc_galaxy_list), N_STELLAR_REALS))
@@ -163,7 +165,9 @@ def compute_AM_realization(abundance_match, deconv, sparc_galaxy_list, mass_mode
         dm_vels[j, :] = V_dm_max
         bar_vels[j, :] = V_bar_max
 
-    return vels, masses, dm_vels, bar_vels, 
+    rc_time = time.time() - am_start_time - matching_time
+    print(f"Rotation curve time: {rc_time} s")
+    return vels, masses, dm_vels, bar_vels
 
 if rank == 0:
 
@@ -196,24 +200,48 @@ if rank == 0:
     log_stellar_masses, SMF_data, _ = get_GSMF_ELPETRO(plotting=False)
     halos = np.load("/Users/fedorboreiko/Documents/Oxford/Personal_codes/Codebase/halos_z_0p00.npy")
 
+    n_remove = int(np.floor(X * halos.shape[0]))
+    sorted_indices = np.argsort(halos['vmax'])[::-1]
+    remove_indices = sorted_indices[:n_remove]
+    halos_selected = np.delete(halos, remove_indices)
+
     # Create abundance matching (AM) object
-    proxy = proxies["mvir_proxy"]()
+    proxy = proxies["mvir_proxy"](use_cache=False)
     abundance_match = AbundanceMatch(log_stellar_masses[10:], SMF_data[10:], halo_proxy=proxy, ext_range=(3.0, 12.0),
                                      boxsize=140, faint_end_first=True, scatter_mult=1, faint_end_slope=-0.42)
 
     theta = {"alpha": ALPHA, "scatter": SCATTER}  # AM model parameters
     # Deconvolute the AM catalog
-    deconv = abundance_match.deconvoluted_catalogs(theta, halos)
+    deconv = abundance_match.deconvoluted_catalogs(theta, halos_selected)
 
-    # Load contra interpolator
-    with open("/Users/fedorboreiko/Documents/Oxford/Personal_codes/Codebase/contra_emulators/contra_interpolators_fullrange.pkl", "rb") as f:
-        interpolators = pickle.load(f)
-
-    if NU in interpolators:
-        contra_interpolator = SafeInterpolator(interpolators[NU])
-    else:
-        print(f"Interpolator for nu={NU} not found.")
+    # Instead of loading a pre-trained interpolator, load grids and then build the jax-based callable.
+    try:
+        with open("/Users/fedorboreiko/Documents/Oxford/Personal_codes/Codebase/contra_emulators/grids_fullrange.pkl", "rb") as f:
+            contra_grids = pickle.load(f)
+    except FileNotFoundError:
+        print("Error: Contra emulator grids were not found. Please run the grid-generation script first.")
         sys.exit(1)
+
+    # Define grid axes matching the interpolation grid-generation stage.
+    N_SAMPLES = 50  # must match the grid generation
+    log_c_grid  = np.linspace(0, 3.9, N_SAMPLES)
+    log_fb_grid = np.linspace(-3.6, -0.03, N_SAMPLES)
+    log_rb_grid = np.linspace(-3, -1, N_SAMPLES)
+    log_rf_grid = np.linspace(-4.8, 0.3, N_SAMPLES)
+    grid_axes = [log_c_grid, log_fb_grid, log_rb_grid, log_rf_grid]
+
+    if NU != 0.0:
+        if NU in contra_grids:
+            # Create a contra_interpolator that uses the JAX-based interpolation.
+            contra_grid = contra_grids[NU]
+            grid_jax = jnp.array(contra_grid, dtype=jnp.float64)
+            def contra_interpolator(points):
+                return jax_contra_interpolator(grid_jax, points, grid_axes)
+        else:
+            print(f"Contra emulator for nu={NU} is not available. Please verify that the grid-generation script includes nu={NU}.")
+            sys.exit(1)
+    else:
+        contra_interpolator = None
 
 else:
 
@@ -229,7 +257,7 @@ else:
     L_bulges = None
     abundance_match = None
     deconv = None
-    halos = None
+    halos_selected = None
     contra_interpolator = None
 
 # Broadcast data to all processes
@@ -245,8 +273,16 @@ dists_err = comm.bcast(dists_err, root=0)
 L_bulges = comm.bcast(L_bulges, root=0)
 abundance_match = comm.bcast(abundance_match, root=0)
 deconv = comm.bcast(deconv, root=0)
-halos = comm.bcast(halos, root=0)
+halos_selected = comm.bcast(halos_selected, root=0)
 contra_interpolator = comm.bcast(contra_interpolator, root=0)
+
+log_c_grid  = np.linspace(0, 3.9, N_SAMPLES)
+log_fb_grid = np.linspace(-3.6, -0.03, N_SAMPLES)
+log_rb_grid = np.linspace(-3, -1, N_SAMPLES)
+log_rf_grid = np.linspace(-4.8, 0.3, N_SAMPLES)
+
+bounds = [[log_c_grid[0], log_c_grid[-1]], [log_fb_grid[0], log_fb_grid[-1]],
+            [log_rb_grid[0], log_rb_grid[-1]], [log_rf_grid[0], log_rf_grid[-1]]]
 
 # Split the realizations across processes
 realizations_per_process = np.array_split(np.arange(N_AM_REALS), size)
@@ -263,7 +299,7 @@ if rank == 0:
 
 for i, realization in enumerate(local_realizations):
 
-    vels, masses, dm_vels, bar_vels = compute_AM_realization(abundance_match, deconv, sparc_galaxy_list, mass_models, halos,
+    vels, masses, dm_vels, bar_vels = compute_AM_realization(abundance_match, deconv, sparc_galaxy_list, mass_models, halos_selected,
                                        L_bulges, L_36_means, L_36_errors, Eff_radii, MH1_means, MH1_errors, dists, dists_err,
                                        contra_interpolator)
     local_vels[i, :, :] = vels
@@ -357,6 +393,6 @@ if rank == 0:
                         V_mock[galnum], V_mock_err[galnum],
                         V_obs[galnum], V_obs_err[galnum],
                         M_mock[galnum], 10, 10, 
-                        f'/Users/fedorboreiko/Documents/Oxford/btfr_z/plots/RTstats_alpha_{ALPHA}_scatter_{SCATTER}_nu_{NU}/RTstats_galaxy_{galnum}_alpha_{ALPHA}_scatter_{SCATTER}_nu_{NU}.png')
+                        f'/Users/fedorboreiko/Documents/Oxford/btfr_z/plots/RTstats_alpha_{ALPHA}_scatter_{SCATTER}_x{X}_nu_{NU}/RTstats_galaxy_{galnum}_alpha_{ALPHA}_scatter_{SCATTER}_nu_{NU}.png')
 
-    btfr_plot(V_mock, M_mock, V_mock_err, M_mock_err, V_obs, M_obs, V_obs_err, M_obs_err, plotname=f'/Users/fedorboreiko/Documents/Oxford/btfr_z/plots/btfr_alpha_{ALPHA}_scatter_{SCATTER}_nu_{NU}.png')
+    btfr_plot(log_likelihood, V_mock, M_mock, V_mock_err, M_mock_err, V_obs, M_obs, V_obs_err, M_obs_err, plotname=f'/Users/fedorboreiko/Documents/Oxford/btfr_z/plots/btfr_alpha_{ALPHA}_scatter_{SCATTER}_x_{X}_nu_{NU}.png')
