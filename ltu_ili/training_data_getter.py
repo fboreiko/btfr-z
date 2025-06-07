@@ -7,7 +7,7 @@ Units are Mstar: log10(Msun/h), Mvir: log10(Msun/h), Concentration: unitless.
 
 import numpy as np
 from mpi4py import MPI
-from btfr.massfuncs import get_GSMF_ELPETRO
+from btfr.utils.massfuncs import get_GSMF_ELPETRO
 from BAM import AbundanceMatch, proxies
 from btfr.btfr_utils import update_progress
 from tqdm import tqdm

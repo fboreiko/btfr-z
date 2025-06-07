@@ -3,7 +3,7 @@
 from mpi4py import MPI
 import numpy as np
 import pandas as pd
-from btfr.massfuncs import get_GSMF_ELPETRO
+from btfr.utils.massfuncs import get_GSMF_ELPETRO
 from BAM import AbundanceMatch, proxies
 from btfr.btfr_utils import update_progress
 from tqdm import tqdm

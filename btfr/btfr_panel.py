@@ -2,34 +2,41 @@ import sys
 sys.path.append('/Users/fedorboreiko/Documents/Oxford/btfr_z')
 
 import numpy as np
+import numpy.lib.recfunctions as rfn
 import pandas as pd
-from btfr.massfuncs import get_GSMF_ELPETRO
+from btfr.utils.massfuncs import get_GSMF_ELPETRO
 from BAM import AbundanceMatch, proxies
-from btfr.btfr_plotting import btfr_plot
-from btfr.btfr_utils import halo_selection, nfw_circular_velocity_contra, nfw_circular_velocity, get_loglike
+from btfr.utils.plotting_utils import btfr_plot
+from btfr.btfr_utils import get_x_cutoff_fit, nfw_circular_velocity_contra, nfw_circular_velocity, get_loglike
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 from matplotlib import rcParams
 from scipy.stats import binned_statistic
 import pickle
+import jax
+import jax.numpy as jnp
+from jax.scipy.ndimage import map_coordinates
+from functools import partial
+
+jax.config.update("jax_enable_x64", True)
 
 # Set the font to Computer Modern (LaTeX default) and enable LaTeX rendering
 rcParams['font.family'] = 'serif'
 rcParams['font.serif'] = ['Computer Modern']
 rcParams['text.usetex'] = True
 
-N_AM_REALS = 10
+N_AM_REALS = 100
 N_STELLAR_REALS = 1000
 
 SCATTER_1 = 0.01
-ALPHA_1 = -1000
-X_1 = 0.0
-NU_1 = np.linspace(-3.0, 3.0, 20)[5]
-SCATTER_2 = 0.08
-ALPHA_2 = -1000
-X_2 = 0.08
-NU_2 = np.linspace(-3.0, 3.0, 20)[12]
-VMAXSHIFT = False
+ALPHA_1 = -100
+X_1 = 0.36
+NU_1 = np.linspace(-3.0, 3.0, 20)[13]
+SCATTER_2 = 0.01
+ALPHA_2 = -100
+X_2 = 0.35
+NU_2 = np.linspace(-3.0, 3.0, 20)[5]
+VMAXSHIFT = True
 
 M2L_DISK_MEAN = 0.5
 M2L_DISK_ERROR = 0.2 # dex
@@ -49,27 +56,26 @@ bulge_lumins = bulge_lumins[bulge_lumins['Galaxy'].isin(sparc_galaxy_list)]
 mass_models = mass_models[mass_models['ID'].isin(sparc_galaxy_list)]
 galaxy_sample = galaxy_sample[galaxy_sample['Galaxy'].isin(sparc_galaxy_list)]
 
-# Wrapper class around original interpolator 
-class SafeInterpolator:
-    def __init__(self, interpolator):
-        self.interpolator = interpolator
-        self.bounds = np.array([[0, 3.9],    #full c range. Previously [0.01, 3]
-                                [-3.6, -0.03], #full fb range. Previously [-3.3, -0.3]
-                                [-3, -1], #full rb range. Previously [-2.9, -1.3]
-                                [-4.8, 0.3]]) #full rf range. Previously [-4.8, 0.3]
-    def __call__(self, points):
-        results = np.zeros(points.shape[0])  # Initialize results with zeros matching the number of input points
-        valid_mask = np.all(
-            (points >= self.bounds[:, 0]) & (points <= self.bounds[:, 1]), axis=1
-        )
-        valid_points = points[valid_mask]
+@partial(jax.jit, static_argnames=("order",))
+def jax_contra_interpolator(grid, positions, grid_axes, order=1):
+    """
+    A thin wrapper that converts the grid and query points into JAX arrays,
+    performs interpolation, and applies a validity mask to handle out-of-bounds points.
+    """
+    indices = []
+    valid_mask = jnp.ones(positions.shape[0], dtype=bool)  # Start with all points valid
+    for i in range(positions.shape[1]):
+        axis = grid_axes[i]
+        grid_min = axis[0]
+        grid_max = axis[-1]
+        n_points = axis.shape[0]
+        index_coord = (positions[:, i] - grid_min) / (grid_max - grid_min) * (n_points - 1)
+        valid_mask &= (positions[:, i] >= grid_min) & (positions[:, i] <= grid_max)
+        indices.append(index_coord)
 
-        if valid_points.size > 0:
-            valid_results = self.interpolator(valid_points)
-            results[valid_mask] = valid_results
-
-        return results
-    
+    coords = jnp.stack(indices, axis=0)  # shape: (dimensions, n_points)
+    interpolated_values = map_coordinates(grid, coords, order=order, mode='constant', cval=0)
+    return interpolated_values * valid_mask
 
 def load_data(galaxy):
     #Loads the data for a given galaxy.
@@ -105,10 +111,13 @@ def forward_model_btfr(alpha, scatter, x, nu, vmaxshift=False):
     # Load the Uchuu halos 
     halos = np.load("/Users/fedorboreiko/Documents/Oxford/Personal_codes/Codebase/halos_z_0p00.npy")
 
-    n_remove = int(np.floor(x * halos.shape[0]))
-    sorted_indices = np.argsort(halos['vmax'])[::-1]
-    remove_indices = sorted_indices[:n_remove]
-    halos_selected = np.delete(halos, remove_indices)
+    slope, intercept = get_x_cutoff_fit(halos, x)
+    halos_selected = halos.copy()
+    halos_selected = rfn.append_fields(halos_selected, 'select', np.ones(halos.shape[0], dtype=int), usemask=False)
+    halo_log_Mvir = np.log10(halos_selected['Mvir'])
+    halo_log_vmax = np.log10(halos_selected['vmax'])
+    predicted_log_vmax = slope * halo_log_Mvir + intercept
+    halos_selected['select'][halo_log_vmax > predicted_log_vmax] = 0
 
     proxy = proxies["mvir_proxy"](use_cache=False)
 
@@ -118,14 +127,34 @@ def forward_model_btfr(alpha, scatter, x, nu, vmaxshift=False):
     theta = {"alpha": alpha, "scatter": scatter}  # Will be tuned?
     deconv = abundance_match.deconvoluted_catalogs(theta, halos_selected)
 
-    # Load contra interpolators
-    with open("/Users/fedorboreiko/Documents/Oxford/Personal_codes/Codebase/contra_emulators/contra_interpolators_fullrange.pkl", "rb") as f:
-        interpolators = pickle.load(f)
+    # Instead of loading a pre-trained interpolator, load grids and then build the jax-based callable.
+    try:
+        with open("/Users/fedorboreiko/Documents/Oxford/Personal_codes/Codebase/contra_emulators/grids_fullrange.pkl", "rb") as f:
+            contra_grids = pickle.load(f)
+    except FileNotFoundError:
+        print("Error: Contra emulator grids were not found. Please run the grid-generation script first.")
+        sys.exit(1)
 
-    if nu in interpolators:
-        interpolator = SafeInterpolator(interpolators[nu])
+    # Define grid axes matching the interpolation grid-generation stage.
+    N_SAMPLES = 50  # must match the grid generation
+    log_c_grid  = np.linspace(0, 3.9, N_SAMPLES)
+    log_fb_grid = np.linspace(-3.6, -0.03, N_SAMPLES)
+    log_rb_grid = np.linspace(-3, -1, N_SAMPLES)
+    log_rf_grid = np.linspace(-4.8, 0.3, N_SAMPLES)
+    grid_axes = [log_c_grid, log_fb_grid, log_rb_grid, log_rf_grid]
+
+    if nu != 0.0:
+        if nu in contra_grids:
+            # Create a contra_interpolator that uses the JAX-based interpolation.
+            contra_grid = contra_grids[nu]
+            grid_jax = jnp.array(contra_grid, dtype=jnp.float64)
+            def contra_interpolator(points):
+                return jax_contra_interpolator(grid_jax, points, grid_axes)
+        else:
+            print(f"Contra emulator for nu={nu} is not available. Please verify that the grid-generation script includes nu={nu}.")
+            sys.exit(1)
     else:
-        raise ValueError(f"Interpolator for nu={nu} not found.")
+        contra_interpolator = None
 
     vels_global = np.empty((len(sparc_galaxy_list), N_AM_REALS, N_STELLAR_REALS))
     masses_global = np.empty((len(sparc_galaxy_list), N_AM_REALS, N_STELLAR_REALS))
@@ -184,7 +213,7 @@ def forward_model_btfr(alpha, scatter, x, nu, vmaxshift=False):
             
             else:
                 # the case of halo contraction/expansion, use contra emulator
-                V_dm = nfw_circular_velocity_contra(rads, Eff_rads, Rvir, rs, Mvir, M_baryon, interpolator)
+                V_dm = nfw_circular_velocity_contra(rads, Eff_rads, Rvir, rs, Mvir, M_baryon, contra_interpolator)
 
             V_dm_max = np.max(V_dm, axis=1)
 
@@ -197,6 +226,10 @@ def forward_model_btfr(alpha, scatter, x, nu, vmaxshift=False):
                                 )) # km/s
 
             V_max[V_dm_max == 0] = 0
+
+            selection_mask = matched_halos['select']
+            V_max *= selection_mask
+            M_baryon *= selection_mask
 
             vels_global[j, i, :] = V_max 
             masses_global[j, i, :] = M_baryon

@@ -1,0 +1,8 @@
+4 parameter model: Log inverse evidence: -187.08308
+Error on log inverse evidence: (-0.001338773934905886, 0.0013369840152879593)
+3 parameter model: Log inverse evidence: -171.41891
+Error on log inverse evidence: (-0.0008072911322174278, 0.0008066399389125135)
+
+
+
+smooth1d.smooth = True?? 

@@ -5,12 +5,14 @@ sys.path.append('/Users/fedorboreiko/Documents/Oxford/btfr_z')
 
 from mpi4py import MPI
 import numpy as np
+from numpy.lib import recfunctions as rfn
 import pandas as pd
-from btfr.massfuncs import get_GSMF_ELPETRO
+from btfr.utils.massfuncs import get_GSMF_ELPETRO
 from BAM import AbundanceMatch, proxies
-from btfr.btfr_plotting import btfr_plot, explore_hist
-from btfr.btfr_utils import nfw_circular_velocity_contra, nfw_circular_velocity, get_loglike
+from btfr.utils.plotting_utils import btfr_plot, explore_hist
+from btfr.btfr_utils import get_x_cutoff_fit, nfw_circular_velocity_contra, nfw_circular_velocity, get_loglike
 from matplotlib import rcParams
+import matplotlib.pyplot as plt
 from tqdm import tqdm
 import pickle
 import time
@@ -28,10 +30,10 @@ rcParams['text.usetex'] = True
 N_AM_REALS = 10
 N_STELLAR_REALS = 1000
 
-ALPHA = -1000
-SCATTER = 0.1
+ALPHA = -2
+SCATTER = 0.01
 X = 0.6
-NU = np.linspace(-3.0, 3.0, 20)[2]
+NU = np.linspace(-3.0, 3.0, 20)[10]
 
 M2L_DISK_MEAN = 0.5
 M2L_DISK_ERROR = 0.2
@@ -51,11 +53,12 @@ if rank == 0:
 @partial(jax.jit, static_argnames=("order",))
 def jax_contra_interpolator(grid, positions, grid_axes, order=1):
     """
-    A thin wrapper that converts the grid and query points into JAX arrays,
-    performs interpolation, and applies a validity mask to handle out-of-bounds points.
+    A thin wrapper that converts the contra grid and query points into JAX arrays,
+    performs interpolation, and applies a validity mask to handle out-of-bounds points
+    by setting the log(mhi) value to nans.
     """
     indices = []
-    valid_mask = jnp.ones(positions.shape[0], dtype=bool)  # Start with all points valid
+    valid_mask = jnp.ones(positions.shape[0], dtype=bool)
     for i in range(positions.shape[1]):
         axis = grid_axes[i]
         grid_min = axis[0]
@@ -67,13 +70,11 @@ def jax_contra_interpolator(grid, positions, grid_axes, order=1):
 
     coords = jnp.stack(indices, axis=0)  # shape: (dimensions, n_points)
     interpolated_values = map_coordinates(grid, coords, order=order, mode='constant', cval=0)
-    return interpolated_values * valid_mask
+    return jnp.where(valid_mask, interpolated_values, jnp.nan)
 
 def compute_AM_realization(abundance_match, deconv, sparc_galaxy_list, mass_models, halos, 
                            L_bulges, L_36_means, L_36_errors, Eff_rads, MH1_means, MH1_errors, 
                            dists, dists_err, emulator):
-    
-    am_start_time = time.time()
     
     # Add scatter to the deconvoluted catalog, and return the catalog of stellar masses matched to halos from the halo catalog
     mask, catalog_sc = abundance_match.add_scatter(deconv, cut_range=(3, 12), return_catalog=True)
@@ -103,9 +104,6 @@ def compute_AM_realization(abundance_match, deconv, sparc_galaxy_list, mass_mode
     indices = sorted_indices[indices_sorted].reshape(len(sparc_galaxy_list), N_STELLAR_REALS)
 
     matched_halos = halos[indices]
-
-    matching_time = time.time() - am_start_time
-    print(f"Matching time: {matching_time} s")
 
     # Simulate the rotation curves
     vels = np.empty((len(sparc_galaxy_list), N_STELLAR_REALS))
@@ -144,10 +142,6 @@ def compute_AM_realization(abundance_match, deconv, sparc_galaxy_list, mass_mode
                                 V_dm * np.abs(V_dm),
                                 axis=1
                             )) # km/s
-        
-        # handle cases where V_dm is an array of zeros
-        V_dm_max = np.max(V_dm, axis=1)
-        V_max[V_dm_max == 0] = 0
 
         vels[j, :] = V_max
         masses[j, :] = M_baryon
@@ -160,13 +154,15 @@ def compute_AM_realization(abundance_match, deconv, sparc_galaxy_list, mass_mode
                                     axis=1
                                 )) # km/s
         
-        V_bar_max[V_dm_max == 0] = 0
-
-        dm_vels[j, :] = V_dm_max
+        dm_vels[j, :] = np.max(V_dm, axis=1)
         bar_vels[j, :] = V_bar_max
+    
+    selection_mask = matched_halos['select']
+    vels *= selection_mask
+    masses *= selection_mask
+    dm_vels *= selection_mask
+    bar_vels *= selection_mask
 
-    rc_time = time.time() - am_start_time - matching_time
-    print(f"Rotation curve time: {rc_time} s")
     return vels, masses, dm_vels, bar_vels
 
 if rank == 0:
@@ -200,10 +196,14 @@ if rank == 0:
     log_stellar_masses, SMF_data, _ = get_GSMF_ELPETRO(plotting=False)
     halos = np.load("/Users/fedorboreiko/Documents/Oxford/Personal_codes/Codebase/halos_z_0p00.npy")
 
-    n_remove = int(np.floor(X * halos.shape[0]))
-    sorted_indices = np.argsort(halos['vmax'])[::-1]
-    remove_indices = sorted_indices[:n_remove]
-    halos_selected = np.delete(halos, remove_indices)
+    # Implement halo selection on the halo catalog
+    slope, intercept = get_x_cutoff_fit(halos, X)
+    halos_selected = halos.copy()
+    halos_selected = rfn.append_fields(halos_selected, 'select', np.ones(halos.shape[0], dtype=float), usemask=False)
+    halo_log_Mvir = np.log10(halos_selected['Mvir'])
+    halo_log_vmax = np.log10(halos_selected['vmax'])
+    predicted_log_vmax = slope * halo_log_Mvir + intercept
+    halos_selected['select'][halo_log_vmax > predicted_log_vmax] = np.nan
 
     # Create abundance matching (AM) object
     proxy = proxies["mvir_proxy"](use_cache=False)
@@ -273,6 +273,7 @@ dists_err = comm.bcast(dists_err, root=0)
 L_bulges = comm.bcast(L_bulges, root=0)
 abundance_match = comm.bcast(abundance_match, root=0)
 deconv = comm.bcast(deconv, root=0)
+halos = comm.bcast(halos, root=0)
 halos_selected = comm.bcast(halos_selected, root=0)
 contra_interpolator = comm.bcast(contra_interpolator, root=0)
 
@@ -299,9 +300,9 @@ if rank == 0:
 
 for i, realization in enumerate(local_realizations):
 
-    vels, masses, dm_vels, bar_vels = compute_AM_realization(abundance_match, deconv, sparc_galaxy_list, mass_models, halos_selected,
-                                       L_bulges, L_36_means, L_36_errors, Eff_radii, MH1_means, MH1_errors, dists, dists_err,
-                                       contra_interpolator)
+    vels, masses, dm_vels, bar_vels = compute_AM_realization(abundance_match, deconv, sparc_galaxy_list, mass_models, halos_selected, 
+                                                             L_bulges, L_36_means, L_36_errors, Eff_radii, MH1_means, MH1_errors, 
+                                                             dists, dists_err, contra_interpolator)
     local_vels[i, :, :] = vels
     local_masses[i, :, :] = masses
     local_dm_vels[i, :, :] = dm_vels
@@ -342,26 +343,19 @@ if rank == 0:
     global_dm_vels_reshaped = np.transpose(global_dm_vels, (1, 0, 2))
     global_bar_vels_reshaped = np.transpose(global_bar_vels, (1, 0, 2))
 
-    def filter_zeros(arr):
-        #Filters out zeros from a 2D array row-wise, returning a list of arrays.
-        return [row[row != 0] for row in arr]
+    V_mocks = np.log10(global_vels_reshaped.reshape(len(galaxy_sample), -1))
 
-    V_mocks_unlogged = filter_zeros(global_vels_reshaped.reshape(len(galaxy_sample), -1))
-    V_mocks = [np.log10(row) for row in V_mocks_unlogged]
-
-    V_dm_mocks_unlogged = filter_zeros(global_dm_vels_reshaped.reshape(len(galaxy_sample), -1))
-    V_bar_mocks_unlogged = filter_zeros(global_bar_vels_reshaped.reshape(len(galaxy_sample), -1))
-    V_dm_mocks = [np.log10(row) for row in V_dm_mocks_unlogged]
-    V_bar_mocks = [np.log10(row) for row in V_bar_mocks_unlogged]
+    V_dm_mocks = np.log10(global_dm_vels_reshaped.reshape(len(galaxy_sample), -1))
+    V_bar_mocks = np.log10(global_bar_vels_reshaped.reshape(len(galaxy_sample), -1))
 
     # Print the percentages
     original_length = N_AM_REALS * N_STELLAR_REALS
-    filtered_lengths = [len(row) for row in V_mocks_unlogged]
+    filtered_lengths = [np.count_nonzero(~np.isnan(row)) for row in V_mocks]
     print("Percentage of original array length retained after filtering out-of-bound points (per galaxy):")
     print([round((length / original_length) * 100, 2) for length in filtered_lengths])
 
-    V_mock = np.array([np.mean(row) for row in V_mocks])
-    V_mock_err = np.array([np.std(row) for row in V_mocks])
+    V_mock = np.array([np.nanmean(row) for row in V_mocks])
+    V_mock_err = np.array([np.nanstd(row) for row in V_mocks])
 
     # Observed data
     V_obs_unlogged = np.array(sparc_btfr['Vmax'])
@@ -375,11 +369,10 @@ if rank == 0:
     print(f'Log likelihood: {log_likelihood}')
 
     # Plot the BTFR
-    M_mocks_unlogged = filter_zeros(global_masses_reshaped.reshape(len(galaxy_sample), -1))
-    M_mocks = [np.log10(row) for row in M_mocks_unlogged]
+    M_mocks = np.log10(global_masses_reshaped.reshape(len(galaxy_sample), -1))
 
-    M_mock = np.array([np.mean(row) for row in M_mocks])
-    M_mock_err = np.array([np.std(row) for row in M_mocks])
+    M_mock = np.array([np.nanmean(row) for row in M_mocks])
+    M_mock_err = np.array([np.nanstd(row) for row in M_mocks])
 
     M_obs = np.array(sparc_btfr['log(Mb)'])
     M_obs_err = np.array(sparc_btfr['e_log(Mb)'])
@@ -393,6 +386,6 @@ if rank == 0:
                         V_mock[galnum], V_mock_err[galnum],
                         V_obs[galnum], V_obs_err[galnum],
                         M_mock[galnum], 10, 10, 
-                        f'/Users/fedorboreiko/Documents/Oxford/btfr_z/plots/RTstats_alpha_{ALPHA}_scatter_{SCATTER}_x{X}_nu_{NU}/RTstats_galaxy_{galnum}_alpha_{ALPHA}_scatter_{SCATTER}_nu_{NU}.png')
+                        f'/Users/fedorboreiko/Documents/Oxford/btfr_z/plots/RTstats_alpha_{ALPHA}_scatter_{SCATTER}_x{X}_nu_{NU}/RTstats_galaxy_{galnum}_alpha_{ALPHA}_scatter_{SCATTER}_nu_{NU:.3f}.png')
 
-    btfr_plot(log_likelihood, V_mock, M_mock, V_mock_err, M_mock_err, V_obs, M_obs, V_obs_err, M_obs_err, plotname=f'/Users/fedorboreiko/Documents/Oxford/btfr_z/plots/btfr_alpha_{ALPHA}_scatter_{SCATTER}_x_{X}_nu_{NU}.png')
+    btfr_plot(log_likelihood, V_mock, M_mock, V_mock_err, M_mock_err, V_obs, M_obs, V_obs_err, M_obs_err, plotname=f'/Users/fedorboreiko/Documents/Oxford/btfr_z/plots/btfr_alpha_{ALPHA}_scatter_{SCATTER}_x_{X}_nu_{NU:.3f}.png')

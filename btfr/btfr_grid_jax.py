@@ -5,21 +5,22 @@ sys.path.append('/Users/fedorboreiko/Documents/Oxford/btfr_z')
 
 from mpi4py import MPI
 import numpy as np
+from numpy.lib import recfunctions as rfn
 import pandas as pd
-from massfuncs import get_GSMF_ELPETRO
+from btfr.utils.massfuncs import get_GSMF_ELPETRO
 from BAM import AbundanceMatch, proxies
-from btfr.btfr_utils import nfw_circular_velocity, nfw_circular_velocity_contra, get_loglike
+from btfr.btfr_utils import get_x_cutoff_fit, nfw_circular_velocity, nfw_circular_velocity_contra, get_loglike
 from tqdm import tqdm
 import pickle
-import time
 import jax
 import jax.numpy as jnp
 from jax.scipy.ndimage import map_coordinates
 from functools import partial
+import h5py
 
 jax.config.update("jax_enable_x64", True)
 
-N_AM_REALS = 10
+N_AM_REALS = 1
 N_STELLAR_REALS = 1000
 
 M2L_DISK_MEAN = 0.5
@@ -39,11 +40,12 @@ if rank == 0:
 @partial(jax.jit, static_argnames=("order",))
 def jax_contra_interpolator(grid, positions, grid_axes, order=1):
     """
-    A thin wrapper that converts the grid and query points into JAX arrays,
-    performs interpolation, and applies a validity mask to handle out-of-bounds points.
+    A thin wrapper that converts the contra grid and query points into JAX arrays,
+    performs interpolation, and applies a validity mask to handle out-of-bounds points
+    by setting the log(mhi) value to nans.
     """
     indices = []
-    valid_mask = jnp.ones(positions.shape[0], dtype=bool)  # Start with all points valid
+    valid_mask = jnp.ones(positions.shape[0], dtype=bool)  #start with all points valid
     for i in range(positions.shape[1]):
         axis = grid_axes[i]
         grid_min = axis[0]
@@ -55,7 +57,7 @@ def jax_contra_interpolator(grid, positions, grid_axes, order=1):
 
     coords = jnp.stack(indices, axis=0)  # shape: (dimensions, n_points)
     interpolated_values = map_coordinates(grid, coords, order=order, mode='constant', cval=0)
-    return interpolated_values * valid_mask
+    return jnp.where(valid_mask, interpolated_values, jnp.nan)
 
 def load_data():
     """
@@ -84,9 +86,7 @@ def load_data():
 
 def compute_AM_realization(abundance_match, deconv, nu_value, emulator, galaxy_sample, mass_model_catalog, halo_catalog, 
                            Luminosities_bulge, Luminosities_36, Luminosity_36_errs, Eff_rads, MH1_means, MH1_errors, 
-                           distances, distances_err):
-    
-    am_start_time = time.time()
+                           distances, distances_err, n_stellar_reals):
 
     # Add scatter to the deconvoluted catalog, and return the catalog of stellar masses matched to halos from the halo catalog
     mask, catalog_sc = abundance_match.add_scatter(deconv, cut_range=(3, 12), return_catalog=True)
@@ -96,16 +96,16 @@ def compute_AM_realization(abundance_match, deconv, nu_value, emulator, galaxy_s
     catalog_sc_sorted = catalog_sc[sorted_indices]
 
     # Generate N_STELLAR_REALS of mock stellar masses
-    dist_samples = np.random.normal(loc=distances[:, np.newaxis], scale=distances_err[:, np.newaxis], size=(len(galaxy_sample), N_STELLAR_REALS)) # Mpc
-    L_36_samples = np.random.normal(loc=Luminosities_36[:, np.newaxis], scale=Luminosity_36_errs[:, np.newaxis], size=(len(galaxy_sample), N_STELLAR_REALS)) # 1e9 L_sun
+    dist_samples = np.random.normal(loc=distances[:, np.newaxis], scale=distances_err[:, np.newaxis], size=(len(galaxy_sample), n_stellar_reals)) # Mpc
+    L_36_samples = np.random.normal(loc=Luminosities_36[:, np.newaxis], scale=Luminosity_36_errs[:, np.newaxis], size=(len(galaxy_sample), n_stellar_reals)) # 1e9 L_sun
 
-    log_M2L_disk_samples = np.random.normal(loc=np.log10(M2L_DISK_MEAN), scale=M2L_DISK_ERROR, size=(len(galaxy_sample), N_STELLAR_REALS))
-    log_M2L_bulge_samples = np.random.normal(loc=np.log10(M2L_BULGE_MEAN), scale=M2L_BULGE_ERROR, size=(len(galaxy_sample), N_STELLAR_REALS))
+    log_M2L_disk_samples = np.random.normal(loc=np.log10(M2L_DISK_MEAN), scale=M2L_DISK_ERROR, size=(len(galaxy_sample), n_stellar_reals))
+    log_M2L_bulge_samples = np.random.normal(loc=np.log10(M2L_BULGE_MEAN), scale=M2L_BULGE_ERROR, size=(len(galaxy_sample), n_stellar_reals))
 
     M2L_disk_samples = 10**log_M2L_disk_samples # M_sun / L_sun
     M2L_bulge_samples = 10**log_M2L_bulge_samples # M_sun / L_sun
 
-    MH1_samples = np.random.normal(loc=MH1_means[:, np.newaxis], scale=MH1_errors[:, np.newaxis], size=(len(galaxy_sample), N_STELLAR_REALS)) * 1e9 # M_sun
+    MH1_samples = np.random.normal(loc=MH1_means[:, np.newaxis], scale=MH1_errors[:, np.newaxis], size=(len(galaxy_sample), n_stellar_reals)) * 1e9 # M_sun
 
     M_star_samples = np.abs((L_36_samples - Luminosities_bulge[:, np.newaxis]) * M2L_disk_samples + Luminosities_bulge[:, np.newaxis] * M2L_bulge_samples) * (distances[:, np.newaxis] / dist_samples)**2 * 1e9 * 0.7 # M_sun / h
     log_M_star_samples = np.log10(M_star_samples)
@@ -113,15 +113,12 @@ def compute_AM_realization(abundance_match, deconv, nu_value, emulator, galaxy_s
     # Match the stellar masses to halos
     indices_sorted = np.searchsorted(catalog_sc_sorted, log_M_star_samples.flatten())
     indices_sorted = np.clip(indices_sorted, 0, len(catalog_sc_sorted) - 1)
-    indices = sorted_indices[indices_sorted].reshape(len(galaxy_sample), N_STELLAR_REALS)
+    indices = sorted_indices[indices_sorted].reshape(len(galaxy_sample), n_stellar_reals)
 
     matched_halos = halo_catalog[indices]
 
-    matching_time = time.time() - am_start_time
-    print(f"Matching time: {matching_time} s")
-
     # Simulate the rotation curves
-    vels = np.empty((len(galaxy_sample), N_STELLAR_REALS))
+    vels = np.empty((len(galaxy_sample), n_stellar_reals))
 
     for j, galaxy in enumerate(galaxy_sample):
         # Extract the galaxy's data
@@ -144,8 +141,7 @@ def compute_AM_realization(abundance_match, deconv, nu_value, emulator, galaxy_s
         else:
             # the case of halo contraction/expansion, use contra emulator
             V_dm = nfw_circular_velocity_contra(rads, Eff_rads[j], Rvir, rs, Mvir, M_baryon, emulator)
-                    
-
+        
         # Calculate the maximum circular velocity of the galaxy's total rotation curve
         V_max = np.sqrt(np.max(
                                 V_gas * np.abs(V_gas) +
@@ -155,21 +151,17 @@ def compute_AM_realization(abundance_match, deconv, nu_value, emulator, galaxy_s
                                 axis=1
                             )) # km/s
 
-        # handle cases where V_dm is an array of zeros
-        V_dm_max = np.max(V_dm, axis=1)
-        V_max[V_dm_max == 0] = 0
-
         vels[j, :] = V_max
 
-    rc_time = time.time() - am_start_time - matching_time
-    print(f"Rotation curve time: {rc_time} s")
+    selection_mask = matched_halos['select']
+    vels *= selection_mask
 
     return vels
 
 
 def compute_likelihood(alpha_value, scatter_value, nu_value, abundance_match, emulator, galaxy_sample, mass_model_catalog, 
                        sparc_catalog, halo_catalog, Luminosity_bulge, Luminosity_36, Luminosity_36_errs, Eff_radii, MH1_means, 
-                       MH1_errors, distances, distances_err, Vmax_shift_mode=False):
+                       MH1_errors, distances, distances_err, Vmax_shift_mode, n_stellar_reals):
     
     theta = {"alpha": alpha_value, "scatter": scatter_value}
     deconv = abundance_match.deconvoluted_catalogs(theta, halo_catalog)
@@ -179,13 +171,13 @@ def compute_likelihood(alpha_value, scatter_value, nu_value, abundance_match, em
     local_realizations = realizations_per_process[rank]
 
     # Compute local results
-    local_vels = np.empty((len(local_realizations), len(galaxy_sample), N_STELLAR_REALS))
+    local_vels = np.empty((len(local_realizations), len(galaxy_sample), n_stellar_reals))
 
     for i, realization in enumerate(local_realizations):
 
         vels = compute_AM_realization(abundance_match, deconv, nu_value, emulator, galaxy_sample, mass_model_catalog, 
                                       halo_catalog,Luminosity_bulge, Luminosity_36, Luminosity_36_errs, Eff_radii, 
-                                      MH1_means, MH1_errors, distances, distances_err)
+                                      MH1_means, MH1_errors, distances, distances_err, n_stellar_reals)
 
         local_vels[i, :, :] = vels
 
@@ -193,35 +185,33 @@ def compute_likelihood(alpha_value, scatter_value, nu_value, abundance_match, em
     gathered_vels = None
 
     if rank == 0:
-        gathered_vels = np.empty((N_AM_REALS, len(galaxy_sample), N_STELLAR_REALS))
+        gathered_vels = np.empty((N_AM_REALS, len(galaxy_sample), n_stellar_reals))
 
     comm.Gather(local_vels, gathered_vels, root=0)
 
     # Calculate log likelihood
     if rank == 0:
         
-        gathered_vels_reshaped = np.transpose(gathered_vels, (1, 0, 2))
-
-        V_mocks_unlogged = [row[row != 0] for row in gathered_vels_reshaped.reshape(len(galaxy_sample), -1)]
-
-        V_mocks = [np.log10(row) for row in V_mocks_unlogged]
+        V_mocks = np.log10(np.transpose(gathered_vels, (1, 0, 2)))
+        V_mocks_flat = V_mocks.reshape(len(galaxy_sample), -1)
 
         V_obs_unlogged = np.array(sparc_catalog['Vmax'])
         V_obs_err_unlogged = np.array(sparc_catalog['e_Vmax'])
-
         V_obs = np.log10(V_obs_unlogged)
         V_obs_err = V_obs_err_unlogged / (V_obs_unlogged * np.log(10))
 
-        # Mean velocity shift mode, to investigate the degeneracy between alpha and nu constraints
+        # Mean velocity shift mode
         if Vmax_shift_mode:
             mean_V_obs = np.mean(V_obs)
-            mean_V_mocks = np.mean([np.mean(row) for row in V_mocks if len(row) > 0])
+            mean_V_mocks = np.nanmean(V_mocks_flat)
             shift = mean_V_obs - mean_V_mocks
-            V_mocks = [row + shift for row in V_mocks]
+            V_mocks_mode = V_mocks_flat + shift
+        else:
+            V_mocks_mode = V_mocks_flat
 
-        log_likelihood, _ = get_loglike(V_mocks, V_obs, V_obs_err)
+        log_likelihood, _ = get_loglike(V_mocks_mode, V_obs, V_obs_err)
 
-        return log_likelihood
+        return log_likelihood 
 
     return None
 
@@ -266,12 +256,17 @@ if __name__ == "__main__":
                                     boxsize=140, faint_end_first=True, scatter_mult=1, faint_end_slope=-0.42)
 
     # Define ranges for alpha, scatter, nu and the mode (Vmax shift or not)
-    alpha_proxy_range = np.linspace(-np.pi / 2, 0, 20)
+    grid_size = 20
+    alpha_proxy_range = np.linspace(-np.pi / 2, np.pi / 2, grid_size)
     alpha_range = np.tan(alpha_proxy_range)
-    scatter_range = np.linspace(0.01, 0.6, 10)
-    x_range = np.linspace(0.0, 0.6, 10)
-    nu_range = np.linspace(-3.0, 3.0, 20)
+    scatter_range = np.linspace(0.01, 1, grid_size)
+    x_range = np.linspace(0.0, 0.95, grid_size)
+    nu_range = np.linspace(-3.0, 3.0, grid_size)
     Vmax_shift_mode = False
+
+    N_STELLAR_REALS_MINX = int(N_STELLAR_REALS * (1 - np.max(x_range)) / (1 - np.min(x_range)))
+    n_stellar_range = np.floor(np.linspace(N_STELLAR_REALS_MINX, N_STELLAR_REALS, grid_size)).astype(int)
+    N_STELLAR_REALS_SELECT = int(N_STELLAR_REALS_MINX * (1 - np.min(x_range)))
 
     if rank == 0:
 
@@ -279,7 +274,7 @@ if __name__ == "__main__":
         print(f"scatters from {np.min(scatter_range)} to {np.max(scatter_range)},")
         print(f"x values from {np.min(x_range)} to {np.max(x_range)},")
         print(f"and nu values from {np.min(nu_range)} to {np.max(nu_range)}.")
-        print(f"\nNumber of AM realizations: {N_AM_REALS}, Number of stellar mass realizations: {N_STELLAR_REALS}")
+        print(f"\nNumber of AM realizations: {N_AM_REALS}, Number of stellar mass realizations (after selection): {N_STELLAR_REALS_SELECT}")
         
         if Vmax_shift_mode:
             print('Vmax shift\n')
@@ -292,16 +287,20 @@ if __name__ == "__main__":
 
     likelihood_grid = np.empty((len(alpha_range), len(scatter_range), len(x_range), len(nu_range)))
 
-    for i, x in enumerate(x_range):
+    for i_x, x in enumerate(x_range):
 
-        # Implement halo selection on the halo catalog: cut off the fraction of x * 100% of halos starting
-        # from the highest Vmax values
-        n_remove = int(np.floor(x * halos.shape[0]))
-        sorted_indices = np.argsort(halos['vmax'])[::-1]
-        remove_indices = sorted_indices[:n_remove]
-        halos_selected = np.delete(halos, remove_indices)
+        # Implement halo selection on the halo catalog
+        slope, intercept = get_x_cutoff_fit(halos, x)
+        halos_selected = halos.copy()
+        halos_selected = rfn.append_fields(halos_selected, 'select', np.ones(halos.shape[0], dtype=float), usemask=False)
+        halo_log_Mvir = np.log10(halos_selected['Mvir'])
+        halo_log_vmax = np.log10(halos_selected['vmax'])
+        predicted_log_vmax = slope * halo_log_Mvir + intercept
+        halos_selected['select'][halo_log_vmax > predicted_log_vmax] = np.nan
 
-        for j, nu in enumerate(nu_range):
+        n_stellar = n_stellar_range[i_x] # in order to keep the number of matched halos constant
+
+        for i_nu, nu in enumerate(nu_range):
 
             if nu != 0.0:
                 if nu in contra_grids:
@@ -317,24 +316,26 @@ if __name__ == "__main__":
                 contra_interpolator = None
 
             # Compute likelihood for each combination of alpha, scatter, and nu
-            for k, alpha in enumerate(alpha_range):
+            for i_alpha, alpha in enumerate(alpha_range):
 
-                for f, scatter in enumerate(scatter_range):
+                for i_scatter, scatter in enumerate(scatter_range):
 
                     likelihood = compute_likelihood(alpha, scatter, nu, abundance_match, contra_interpolator, galaxy_list, mass_models, sparc_btfr, 
                                                     halos_selected, L_bulges, L_36_means, L_36_errors, Eff_radii, MH1_means, MH1_errors, dists, dists_err,
-                                                    Vmax_shift_mode)
+                                                    Vmax_shift_mode, n_stellar)
 
                     if likelihood is not None:
-                        likelihood_grid[k, f, i, j] = likelihood
+                        likelihood_grid[i_alpha, i_scatter, i_x, i_nu] = likelihood
                         pbar.update(1)
+
+        del halos_selected
 
     if rank == 0:
         pbar.close()
 
         if Vmax_shift_mode:
-            np.save(f'likelihood_grid_{N_AM_REALS}am_{N_STELLAR_REALS}stellar_alphaproxy_{np.min(alpha_proxy_range)}_{np.max(alpha_proxy_range)}_scatter_{np.min(scatter_range)}_{np.max(scatter_range)}_x_{np.min(x_range)}_{np.max(x_range)}_nu_{np.min(nu_range)}_{np.max(nu_range)}_vmaxshift.npy', likelihood_grid)
+            np.save(f'likelihood_grid_{N_AM_REALS}am_{N_STELLAR_REALS_SELECT}stellar_alphaproxy_{np.min(alpha_proxy_range)}_{np.max(alpha_proxy_range)}_scatter_{np.min(scatter_range)}_{np.max(scatter_range)}_x_{np.min(x_range)}_{np.max(x_range)}_nu_{np.min(nu_range)}_{np.max(nu_range)}_vmaxshift.npy', likelihood_grid)
         else:
-            np.save(f'likelihood_grid_{N_AM_REALS}am_{N_STELLAR_REALS}stellar_alphaproxy_{np.min(alpha_proxy_range)}_{np.max(alpha_proxy_range)}_scatter_{np.min(scatter_range)}_{np.max(scatter_range)}_x_{np.min(x_range)}_{np.max(x_range)}_nu_{np.min(nu_range)}_{np.max(nu_range)}.npy', likelihood_grid)
+            np.save(f'likelihood_grid_{N_AM_REALS}am_{N_STELLAR_REALS_SELECT}stellar_alphaproxy_{np.min(alpha_proxy_range)}_{np.max(alpha_proxy_range)}_scatter_{np.min(scatter_range)}_{np.max(scatter_range)}_x_{np.min(x_range)}_{np.max(x_range)}_nu_{np.min(nu_range)}_{np.max(nu_range)}.npy', likelihood_grid)
 
         print("Likelihood grid computation complete!")

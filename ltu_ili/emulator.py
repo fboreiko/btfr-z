@@ -1,5 +1,5 @@
 import numpy as np
-from btfr.massfuncs import get_GSMF_Adams, get_GSMF_ELPETRO
+from btfr.utils.massfuncs import get_GSMF_Adams, get_GSMF_ELPETRO
 from BAM import AbundanceMatch, proxies
 from ili.dataloaders import NumpyLoader
 from ili.inference import InferenceRunner

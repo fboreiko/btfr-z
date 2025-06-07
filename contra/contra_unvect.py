@@ -1,18 +1,15 @@
 import numpy as np
 from scipy.optimize import root_scalar
-import matplotlib.pyplot as plt
-from matplotlib import rcParams
-
-# Set the font to Computer Modern (LaTeX default) and enable LaTeX rendering
-rcParams['font.family'] = 'serif'
-rcParams['font.serif'] = ['Computer Modern']
-rcParams['text.usetex'] = True
 
 r0 = 0.03  # Rvir
 
 def dm_mass_fraction(x, fb, c):
-
     """
+    This function calculates the dark matter mass fraction at a given radius x
+    assuming an NFW profile.
+
+    m_h(x) = (1 - f_b) * M_h(x) / M_h(1)
+
     Inputs: x in unitless (rads/R_vir)
             fb in unitless (M_bar/M_vir)
             c in unitless (R_vir/r_s)
@@ -26,8 +23,12 @@ def dm_mass_fraction(x, fb, c):
 
 
 def bar_mass_fraction(x, fb, rb):
-
     """
+    This function calculates the baryonic mass fraction at a given radius x
+    assuming an exponential profile.
+
+    m_b(x) = f_b * M_b(x) / M_b(1)
+
     Inputs: x in unitless (rads/R_vir)
             fb in unitless (M_bar/M_vir)
             rb in unitless (r_b/R_vir)
@@ -35,29 +36,17 @@ def bar_mass_fraction(x, fb, rb):
              d in unitless
     """
 
-    f = fb * (1 - (1 + x / rb) * np.exp(-x / rb)) / (1 - 2 * np.exp(-1 / rb))
-    d = fb * x / rb**2 * np.exp(-x / rb) / (1 - 2 * np.exp(-1 / rb))
+    mb = fb * (1 - (1 + x / rb) * np.exp(-x / rb)) / (1 - 2 * np.exp(-1 / rb))
+    dmb = fb * x / rb**2 * np.exp(-x / rb) / (1 - 2 * np.exp(-1 / rb))
 
-    return f, d
-
-
-def tracer_density(x, rb):
-
-    """
-    Inputs: x in unitless (rads/R_vir)
-            rb in unitless (r_b/R_vir)
-    Outputs: rho in unitless
-    NFW
-    """
-
-    rho = 1 / (x * (rb + x)**2)
-
-    return rho
+    return mb, dmb
 
 
 def y(r, A, w):
-    
         """
+        This function calculates the average orbital radius and its derivative
+        at a given radius r using a power-law approximation from Gnedin et al. 2004.
+
         Inputs: r in unitless (rads/R_vir)
                 A in unitless
                 w in unitless
@@ -83,9 +72,9 @@ def y(r, A, w):
 def funcd(r, fb, rb, mhi, g, A, w):
 
     x, dy = y(r, A, w) #x is unitless, dy is unitless
-    mbx, dmb = bar_mass_fraction(x, fb, rb) #mbx is unitless, dmb is unitless
-    f = r * (mhi + mbx) - g
-    df = mhi + mbx + r * dmb * dy
+    mb, dmb = bar_mass_fraction(x, fb, rb) #mbx is unitless, dmb is unitless
+    f = r * (mhi + mb) - g
+    df = mhi + mb + r * dmb * dy
 
     return f, df
 
@@ -115,19 +104,20 @@ def find_root(r, fb, rb, mhi, g, A, w):
 
 def do_contra(ri, c, fb, rb, A, w):
 
-    # Logarithms of initial radii and dark matter masses
+    # Calculate the dark matter mass fraction at the initial radii m_hi
     mhi = dm_mass_fraction(ri, fb, c)
 
     # Remap initial mass distributions on the average orbital radii
-    rav, _ = y(ri, A, w)
-    mhi_av = dm_mass_fraction(rav, fb, c)
+    ri_av, _ = y(ri, A, w)
+    mhi_av = dm_mass_fraction(ri_av, fb, c)
+
+    # Calculate the gravitational force at the average orbital radii???
     g = mhi_av * ri / (1 - fb)
 
     # Find the roots of the function f(r) = 0
     rf = np.zeros(len(ri))
 
     for i in range(len(ri)):
-        rad_f = find_root(ri[i], fb, rb, mhi_av[i], g[i], A, w)
-        rf[i] = rad_f
+        rf[i] = find_root(ri[i], fb, rb, mhi_av[i], g[i], A, w)
 
     return rf, mhi

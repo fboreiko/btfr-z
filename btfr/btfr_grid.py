@@ -5,15 +5,15 @@ sys.path.append('/Users/fedorboreiko/Documents/Oxford/btfr_z')
 
 from mpi4py import MPI
 import numpy as np
+from numpy.lib import recfunctions as rfn
 import pandas as pd
-from massfuncs import get_GSMF_ELPETRO
+from btfr.utils.massfuncs import get_GSMF_ELPETRO
 from BAM import AbundanceMatch, proxies
 from btfr.btfr_utils import nfw_circular_velocity, nfw_circular_velocity_contra, get_loglike
 from tqdm import tqdm
 import pickle
-import time
 
-N_AM_REALS = 10
+N_AM_REALS = 1
 N_STELLAR_REALS = 1000
 
 M2L_DISK_MEAN = 0.5
@@ -80,9 +80,7 @@ def load_data():
     
 def compute_AM_realization(abundance_match, deconv, nu_value, emulator, galaxy_sample, mass_model_catalog, halo_catalog, 
                            Luminosities_bulge, Luminosities_36, Luminosity_36_errs, Eff_rads, MH1_means, MH1_errors, 
-                           distances, distances_err):
-    
-    am_start_time = time.time()
+                           distances, distances_err, n_stellar_reals=N_STELLAR_REALS):
 
     # Add scatter to the deconvoluted catalog, and return the catalog of stellar masses matched to halos from the halo catalog
     mask, catalog_sc = abundance_match.add_scatter(deconv, cut_range=(3, 12), return_catalog=True)
@@ -92,16 +90,16 @@ def compute_AM_realization(abundance_match, deconv, nu_value, emulator, galaxy_s
     catalog_sc_sorted = catalog_sc[sorted_indices]
 
     # Generate N_STELLAR_REALS of mock stellar masses
-    dist_samples = np.random.normal(loc=distances[:, np.newaxis], scale=distances_err[:, np.newaxis], size=(len(galaxy_sample), N_STELLAR_REALS)) # Mpc
-    L_36_samples = np.random.normal(loc=Luminosities_36[:, np.newaxis], scale=Luminosity_36_errs[:, np.newaxis], size=(len(galaxy_sample), N_STELLAR_REALS)) # 1e9 L_sun
+    dist_samples = np.random.normal(loc=distances[:, np.newaxis], scale=distances_err[:, np.newaxis], size=(len(galaxy_sample), n_stellar_reals)) # Mpc
+    L_36_samples = np.random.normal(loc=Luminosities_36[:, np.newaxis], scale=Luminosity_36_errs[:, np.newaxis], size=(len(galaxy_sample), n_stellar_reals)) # 1e9 L_sun
 
-    log_M2L_disk_samples = np.random.normal(loc=np.log10(M2L_DISK_MEAN), scale=M2L_DISK_ERROR, size=(len(galaxy_sample), N_STELLAR_REALS))
-    log_M2L_bulge_samples = np.random.normal(loc=np.log10(M2L_BULGE_MEAN), scale=M2L_BULGE_ERROR, size=(len(galaxy_sample), N_STELLAR_REALS))
+    log_M2L_disk_samples = np.random.normal(loc=np.log10(M2L_DISK_MEAN), scale=M2L_DISK_ERROR, size=(len(galaxy_sample), n_stellar_reals))
+    log_M2L_bulge_samples = np.random.normal(loc=np.log10(M2L_BULGE_MEAN), scale=M2L_BULGE_ERROR, size=(len(galaxy_sample), n_stellar_reals))
 
     M2L_disk_samples = 10**log_M2L_disk_samples # M_sun / L_sun
     M2L_bulge_samples = 10**log_M2L_bulge_samples # M_sun / L_sun
 
-    MH1_samples = np.random.normal(loc=MH1_means[:, np.newaxis], scale=MH1_errors[:, np.newaxis], size=(len(galaxy_sample), N_STELLAR_REALS)) * 1e9 # M_sun
+    MH1_samples = np.random.normal(loc=MH1_means[:, np.newaxis], scale=MH1_errors[:, np.newaxis], size=(len(galaxy_sample), n_stellar_reals)) * 1e9 # M_sun
 
     M_star_samples = np.abs((L_36_samples - Luminosities_bulge[:, np.newaxis]) * M2L_disk_samples + Luminosities_bulge[:, np.newaxis] * M2L_bulge_samples) * (distances[:, np.newaxis] / dist_samples)**2 * 1e9 * 0.7 # M_sun / h
     log_M_star_samples = np.log10(M_star_samples)
@@ -109,15 +107,12 @@ def compute_AM_realization(abundance_match, deconv, nu_value, emulator, galaxy_s
     # Match the stellar masses to halos
     indices_sorted = np.searchsorted(catalog_sc_sorted, log_M_star_samples.flatten())
     indices_sorted = np.clip(indices_sorted, 0, len(catalog_sc_sorted) - 1)
-    indices = sorted_indices[indices_sorted].reshape(len(galaxy_sample), N_STELLAR_REALS)
+    indices = sorted_indices[indices_sorted].reshape(len(galaxy_sample), n_stellar_reals)
 
     matched_halos = halo_catalog[indices]
 
-    matching_time = time.time() - am_start_time
-    print(f"Matching time: {matching_time} s")
-
     # Simulate the rotation curves
-    vels = np.empty((len(galaxy_sample), N_STELLAR_REALS))
+    vels = np.empty((len(galaxy_sample), n_stellar_reals))
 
     for j, galaxy in enumerate(galaxy_sample):
 
@@ -157,12 +152,12 @@ def compute_AM_realization(abundance_match, deconv, nu_value, emulator, galaxy_s
 
         vels[j, :] = V_max
 
-    rc_time = time.time() - am_start_time - matching_time
-    print(f"Rotation curve time: {rc_time} s")
+    selection_mask = matched_halos['select']
+    vels *= selection_mask
     return vels
 
 
-def compute_likelihood(alpha_value, scatter_value, nu_value, abundance_match, emulator, galaxy_sample, mass_model_catalog, 
+def compute_likelihood(alpha_value, scatter_value, x_value, nu_value, abundance_match, emulator, galaxy_sample, mass_model_catalog, 
                        sparc_catalog, halo_catalog, Luminosity_bulge, Luminosity_36, Luminosity_36_errs, Eff_radii, MH1_means, 
                        MH1_errors, distances, distances_err, Vmax_shift_mode=False):
 
@@ -173,14 +168,17 @@ def compute_likelihood(alpha_value, scatter_value, nu_value, abundance_match, em
     realizations_per_process = np.array_split(np.arange(N_AM_REALS), size)
     local_realizations = realizations_per_process[rank]
 
+    # Adjust the number of stellar realisations based on x to maintain the same statistics
+    n_stellar_reals = int(N_STELLAR_REALS / (1 - x_value))
+
     # Compute local results
-    local_vels = np.empty((len(local_realizations), len(galaxy_sample), N_STELLAR_REALS))
+    local_vels = np.empty((len(local_realizations), len(galaxy_sample), n_stellar_reals))
 
     for i, realization in enumerate(local_realizations):
 
         vels = compute_AM_realization(abundance_match, deconv, nu_value, emulator, galaxy_sample, mass_model_catalog, 
                                       halo_catalog,Luminosity_bulge, Luminosity_36, Luminosity_36_errs, Eff_radii, 
-                                      MH1_means, MH1_errors, distances, distances_err)
+                                      MH1_means, MH1_errors, distances, distances_err, n_stellar_reals)
 
         local_vels[i, :, :] = vels
 
@@ -188,7 +186,7 @@ def compute_likelihood(alpha_value, scatter_value, nu_value, abundance_match, em
     gathered_vels = None
 
     if rank == 0:
-        gathered_vels = np.empty((N_AM_REALS, len(galaxy_sample), N_STELLAR_REALS))
+        gathered_vels = np.empty((N_AM_REALS, len(galaxy_sample), n_stellar_reals))
 
     comm.Gather(local_vels, gathered_vels, root=0)
 
@@ -281,9 +279,13 @@ if __name__ == "__main__":
         # Implement halo selection on the halo catalog: cut off the fraction of x * 100% of halos starting
         # from the highest Vmax values
         n_remove = int(np.floor(x * halos.shape[0]))
-        sorted_indices = np.argsort(halos['vmax'])[::-1]
+        sorted_indices = np.argsort(halos['res'])[::-1]
         remove_indices = sorted_indices[:n_remove]
-        halos_selected = np.delete(halos, remove_indices)
+        halos_selected = halos.copy()
+        halos_selected = rfn.append_fields(halos_selected, 'select', 
+                                        np.ones(halos_selected.shape, dtype=int),
+                                        usemask=False)
+        halos_selected['select'][remove_indices] = 0
 
         for j, nu in enumerate(nu_range):
 
@@ -297,7 +299,7 @@ if __name__ == "__main__":
 
                 for f, scatter in enumerate(scatter_range):
 
-                    likelihood = compute_likelihood(alpha, scatter, nu, abundance_match, interpolator, galaxy_list, mass_models, sparc_btfr, 
+                    likelihood = compute_likelihood(alpha, scatter, x, nu, abundance_match, interpolator, galaxy_list, mass_models, sparc_btfr, 
                                                     halos_selected, L_bulges, L_36_means, L_36_errors, Eff_radii, MH1_means, MH1_errors, dists, dists_err,
                                                     Vmax_shift_mode)
 
