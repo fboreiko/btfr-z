@@ -1,0 +1,28 @@
+# Large data files - NEVER commit these
+*.npy
+*.pkl
+*.pickle
+
+# CSV data files if they're large
+# Uncomment if your CSV files are > 10MB
+# Tabular_data/*.csv
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+oxford_env/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db

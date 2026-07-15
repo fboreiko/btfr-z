@@ -13,7 +13,7 @@ from mpi4py import MPI
 from tqdm import tqdm
 from BAM import AbundanceMatch, proxies
 from utils import *
-from likelihood_computation import compute_likelihood
+from btfr.code_upgrade_attempt.likelihood_computation import compute_likelihood
 
 @dataclass
 class GridConfig:

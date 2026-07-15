@@ -70,6 +70,36 @@ def nfw_circular_velocity(r, M_vir, R_vir, r_s):
     return vc
 
 
+def nfw_circular_velocity_vect(rads, Mvir, Rvir, rs):
+    """
+    Vectorized version of nfw_circular_velocity that handles multiple galaxies and stellar realizations.
+    
+    Inputs:
+        rads in kpc (2D array of shape (n_galaxies, n_radii))
+        Mvir in M_sun (2D array of shape (n_galaxies, n_stellar_reals))
+        Rvir in kpc (2D array of shape (n_galaxies, n_stellar_reals))
+        rs in kpc (2D array of shape (n_galaxies, n_stellar_reals))
+    Outputs:
+        V_circ in km/s (3D array of shape (n_galaxies, n_stellar_reals, n_radii))
+    """
+    # Expand dimensions for broadcasting
+    rads_expanded = rads[:, np.newaxis, :]  # shape: (n_galaxies, 1, n_radii)
+    Mvir_expanded = Mvir[:, :, np.newaxis]  # shape: (n_galaxies, n_stellar_reals, 1)
+    Rvir_expanded = Rvir[:, :, np.newaxis]  # shape: (n_galaxies, n_stellar_reals, 1)
+    rs_expanded = rs[:, :, np.newaxis]      # shape: (n_galaxies, n_stellar_reals, 1)
+    
+    # Calculate NFW profile components
+    x = rads_expanded / Rvir_expanded  # shape: (n_galaxies, n_stellar_reals, n_radii)
+    c = Rvir_expanded / rs_expanded    # shape: (n_galaxies, n_stellar_reals, n_radii)
+    
+    # Calculate circular velocity using NFW formula
+    vc = np.sqrt((G * Mvir_expanded / rads_expanded) * 
+                 (np.log(1 + c * x) - c * x / (1 + c * x)) / 
+                 (np.log(1 + c) - c / (1 + c)))
+    
+    return vc
+
+
 def nfw_circular_velocity_from_mhi(r, mhi, fb, Mvir):
     """
     Inputs: 
@@ -89,6 +119,48 @@ def nfw_circular_velocity_from_mhi(r, mhi, fb, Mvir):
         valid = fb != 1
         M_enclosed = mhi[valid] / (1 - fb[valid, None]) * Mvir[valid, None]
         v_c[valid] = np.sqrt(G * M_enclosed / r)
+    return v_c
+
+
+def nfw_circular_velocity_from_mhi_vect(rads, mhi, fb, Mvir):
+    """
+    Vectorized version of nfw_circular_velocity_from_mhi that handles multiple galaxies and stellar realizations.
+    
+    Inputs: 
+        rads in kpc (2D array of shape (n_galaxies, n_radii))
+        mhi in unitless (3D array of shape (n_galaxies, n_stellar_reals, n_radii))
+        fb in unitless (2D array of shape (n_galaxies, n_stellar_reals))
+        Mvir in M_sun (2D array of shape (n_galaxies, n_stellar_reals))
+    Outputs: 
+        V_circ in km/s (3D array of shape (n_galaxies, n_stellar_reals, n_radii))
+    """
+    n_galaxies, n_stellar_reals, n_radii = mhi.shape
+    
+    # Expand dimensions for broadcasting
+    rads_expanded = rads[:, np.newaxis, :]  # shape: (n_galaxies, 1, n_radii)
+    fb_expanded = fb[:, :, np.newaxis]      # shape: (n_galaxies, n_stellar_reals, 1)
+    Mvir_expanded = Mvir[:, :, np.newaxis]  # shape: (n_galaxies, n_stellar_reals, 1)
+    
+    # Check for fb = 1 cases
+    fb_not_one = fb_expanded != 1
+    
+    # Initialize output array
+    v_c = np.full((n_galaxies, n_stellar_reals, n_radii), np.nan)
+    
+    # Calculate where fb != 1
+    valid_mask = fb_not_one
+    
+    # Calculate M_enclosed for valid cases
+    # Use np.where to avoid division by zero
+    denominator = np.where(valid_mask, 1 - fb_expanded, 1)  # Use 1 where invalid to avoid division by zero
+    M_enclosed = np.where(valid_mask, mhi / denominator * Mvir_expanded, np.nan)
+    
+    # Calculate circular velocity where valid and avoid division by zero in radius
+    rads_safe = np.where(rads_expanded > 0, rads_expanded, np.inf)  # Use inf where radius is 0 to get 0 velocity
+    v_c = np.where(valid_mask & (rads_expanded > 0), 
+                   np.sqrt(G * M_enclosed / rads_safe), 
+                   np.nan)
+    
     return v_c
 
 
@@ -170,6 +242,68 @@ def update_progress(comm, rank, size, local_progress, total_work):
     all_progress[rank] = local_progress
     comm.Allreduce(MPI.IN_PLACE, all_progress, op=MPI.SUM)
     return int(np.sum(all_progress) / total_work)
+
+
+def nfw_circular_velocity_contra_vect(rads, Eff_rads, Rvir, rs, Mvir, M_baryon, contra_emulator):
+    """
+    Vectorized version of nfw_circular_velocity_contra that handles multiple galaxies at once.
+    
+    Inputs:
+      rads in kpc (2D array of shape (n_galaxies, n_radii))
+      Eff_rads in kpc (1D array of length n_galaxies)
+      Rvir in kpc (2D array of shape (n_galaxies, n_stellar_reals))
+      rs in kpc (2D array of shape (n_galaxies, n_stellar_reals))
+      Mvir in M_sun (2D array of shape (n_galaxies, n_stellar_reals))
+      M_baryon in M_sun (2D array of shape (n_galaxies, n_stellar_reals))
+      contra_emulator: callable that takes points of shape (n,4) and returns interpolated log(mhi)
+      
+    Outputs:
+      vc : array of DM circular velocities in km/s (3D array of shape (n_galaxies, n_stellar_reals, n_radii))
+    """
+    n_galaxies, n_radii = rads.shape
+    n_stellar_reals = Rvir.shape[1]
+    
+    # Calculate derived quantities
+    rb = Eff_rads[:, np.newaxis] / 1.67835  # shape: (n_galaxies, 1)
+    c = Rvir / rs  # shape: (n_galaxies, n_stellar_reals)
+    fb = M_baryon / (Mvir + M_baryon)  # shape: (n_galaxies, n_stellar_reals)
+    rb_uless = rb / Rvir  # shape: (n_galaxies, n_stellar_reals)
+    
+    # Expand dimensions for broadcasting
+    rads_expanded = rads[:, np.newaxis, :]  # shape: (n_galaxies, 1, n_radii)
+    Rvir_expanded = Rvir[:, :, np.newaxis]  # shape: (n_galaxies, n_stellar_reals, 1)
+    
+    # Calculate dimensionless radii
+    rads_uless = rads_expanded / Rvir_expanded  # shape: (n_galaxies, n_stellar_reals, n_radii)
+    
+    # Prepare arrays for emulator input by expanding dimensions appropriately
+    c_expanded = c[:, :, np.newaxis]  # shape: (n_galaxies, n_stellar_reals, 1)
+    fb_expanded = fb[:, :, np.newaxis]  # shape: (n_galaxies, n_stellar_reals, 1)
+    rb_uless_expanded = rb_uless[:, :, np.newaxis]  # shape: (n_galaxies, n_stellar_reals, 1)
+    
+    # Broadcast to full shape
+    logc_extended = np.broadcast_to(np.log10(c_expanded), rads_uless.shape)  # shape: (n_galaxies, n_stellar_reals, n_radii)
+    logfb_extended = np.broadcast_to(np.log10(fb_expanded), rads_uless.shape)
+    logrb_extended = np.broadcast_to(np.log10(rb_uless_expanded), rads_uless.shape)
+    lograds_extended = np.log10(rads_uless)
+    
+    # Flatten for emulator input
+    points = np.vstack((
+        logc_extended.ravel(),
+        logfb_extended.ravel(),
+        logrb_extended.ravel(),
+        lograds_extended.ravel()
+    )).T
+    
+    # Call the emulator
+    logmhi = np.array(contra_emulator(points))  # out-of-bounds points return nan
+    logmhi = logmhi.reshape(rads_uless.shape)  # shape: (n_galaxies, n_stellar_reals, n_radii)
+    mhi = 10**logmhi
+    
+    # Calculate circular velocities using vectorized function
+    vc = nfw_circular_velocity_from_mhi_vect(rads, mhi, fb, Mvir)
+    
+    return vc
 
 
 def get_Rvir(Mvir):

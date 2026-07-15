@@ -36,8 +36,11 @@ def bar_mass_fraction(x, fb, rb):
              d in unitless
     """
 
-    mb = fb * (1 - (1 + x / rb) * np.exp(-x / rb)) / (1 - 2 * np.exp(-1 / rb))
-    dmb = fb * x / rb**2 * np.exp(-x / rb) / (1 - 2 * np.exp(-1 / rb))
+    #mb = fb * (1 - (1 + x / rb) * np.exp(-x / rb)) / (1 - 2 * np.exp(-1 / rb))
+    #dmb = fb * x / rb**2 * np.exp(-x / rb) / (1 - 2 * np.exp(-1 / rb))
+    denom = 1.0 - (1.0 + 1.0/rb) * np.exp(-1.0/rb)
+    mb = fb * (1.0 - (1.0 + x/rb) * np.exp(-x/rb)) / denom
+    dmb = fb * (x / rb**2) * np.exp(-x/rb) / denom  # derivative wrt x
 
     return mb, dmb
 

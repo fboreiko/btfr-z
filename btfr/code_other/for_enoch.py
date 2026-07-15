@@ -1,5 +1,3 @@
-##### mpiexec -n 4 python btfr/btfr_contra.py
-
 import sys
 sys.path.append('/Users/fedorboreiko/Documents/Oxford/btfr_z')
 
@@ -10,7 +8,7 @@ import pandas as pd
 from btfr.utils.massfuncs import get_GSMF_ELPETRO
 from BAM import AbundanceMatch, proxies
 from btfr.utils.plotting_utils import btfr_plot, explore_hist
-from btfr.btfr_utils import get_x_cutoff_fit, nfw_circular_velocity_from_mhi, nfw_circular_velocity, get_loglike
+from btfr.btfr_utils import get_x_cutoff_fit, nfw_circular_velocity_contra, nfw_circular_velocity, get_loglike
 from matplotlib import rcParams
 import matplotlib.pyplot as plt
 from tqdm import tqdm
@@ -20,8 +18,6 @@ import jax
 import jax.numpy as jnp
 from jax.scipy.ndimage import map_coordinates
 from functools import partial
-from contra.contra_unvect import do_contra
-from scipy.optimize import root_scalar
 
 jax.config.update("jax_enable_x64", True)
 
@@ -32,10 +28,10 @@ rcParams['text.usetex'] = True
 N_AM_REALS = 1
 N_STELLAR_REALS = 1
 
-ALPHA = -2
-SCATTER = 0.01
+ALPHA = 1.20
+SCATTER = 0.27
 X = 0.0
-NU = 0.0 #np.linspace(-3.0, 3.0, 20)[10]
+NU = 0.0  #np.linspace(-3.0, 3.0, 20)[10]
 
 M2L_DISK_MEAN = 0.5
 M2L_DISK_ERROR = 0.2
@@ -52,70 +48,12 @@ if rank == 0:
     print('Number of processes:', size)
     print(f'Model parameters: alpha = {ALPHA}, scatter = {SCATTER}, x = {X}, nu = {NU}')
 
-def compute_log_rf_direct(log_ri, c, fb, rb, nu):
-    ri = 10**log_ri
-    rf, _ = do_contra(
-        np.array([ri]), c, fb, rb, A=1.6, w=0.8
-    )
-    # Compute the transformed rf_direct value as given
-    rf = (rf / ri)**nu * ri
-    log_rf = np.log10(rf)
-    return log_rf
-
-# Define the objective function for root finding
-def objective_function(log_ri_value, c, fb, rb, nu, log_rf_value):
-    return compute_log_rf_direct(log_ri_value, c, fb, rb, nu) - log_rf_value
-
-def nfw_circular_velocity_contra(rads, Eff_rad, Rvir, rs, Mvir, M_baryon):
-    """
-    Compute the contracted DM circular velocity.
-    Uses the contra_emulator (RegularGrid or jax-based interpolator) to emulate log(mhi) values.
-    
-    Inputs:
-      rads in kpc (1D array, length e.g. 15)
-      Eff_rad in kpc (a number)
-      Rvir in kpc (1D array, length e.g. 1000)
-      rs in kpc (1D array, length e.g. 1000)
-      Mvir in M_sun (1D array, length e.g. 1000)
-      M_baryon in M_sun (1D array, length e.g. 1000)
-      contra_emulator: callable that takes points of shape (n,4) and returns interpolated log(mhi)
-      
-    Outputs:
-      vc : array of DM circular velocities in km/s (2D array of shape (len(Mvir), len(rads)))
-    """
-    
-    rb = Eff_rad / 1.67835
-    c = Rvir / rs
-    fb = M_baryon/ (Mvir + M_baryon)
-    rb_uless = rb / Rvir
-    rads_uless = rads[np.newaxis, :] / Rvir[:, np.newaxis]
-    log_rads_uless = np.log10(rads_uless)
-
-    mhi = np.zeros((len(Mvir), len(rads)))
-
-    for i in range(len(Mvir)):
-        for j in range(len(rads)):
-            result = root_scalar(
-                objective_function,
-                args=(c[i], fb[i], rb_uless[i], NU, log_rads_uless[i, j]),
-                bracket=[-9, 1],
-                method="brentq",
-                xtol=1e-10,
-                maxiter=10000
-            )
-            log_ri = result.root
-            ri = 10**log_ri
-            _, mhi[i, j] = do_contra(np.array([ri]), c[i], fb[i], rb_uless[i], A=1.6, w=0.8)
-
-    vc = nfw_circular_velocity_from_mhi(rads, mhi, fb, Mvir)
-    return vc
-
 @partial(jax.jit, static_argnames=("order",))
 def jax_contra_interpolator(grid, positions, grid_axes, order=1):
     """
     A thin wrapper that converts the contra grid and query points into JAX arrays,
     performs interpolation, and applies a validity mask to handle out-of-bounds points
-    by setting the log(mhi) value to 0 and later removing them from the final statistics
+    by setting the log(mhi) value to nans.
     """
     indices = []
     valid_mask = jnp.ones(positions.shape[0], dtype=bool)
@@ -130,7 +68,7 @@ def jax_contra_interpolator(grid, positions, grid_axes, order=1):
 
     coords = jnp.stack(indices, axis=0)  # shape: (dimensions, n_points)
     interpolated_values = map_coordinates(grid, coords, order=order, mode='constant', cval=0)
-    return interpolated_values * valid_mask
+    return jnp.where(valid_mask, interpolated_values, jnp.nan)
 
 def compute_AM_realization(abundance_match, deconv, sparc_galaxy_list, mass_models, halos, 
                            L_bulges, L_36_means, L_36_errors, Eff_rads, MH1_means, MH1_errors, 
@@ -186,14 +124,17 @@ def compute_AM_realization(abundance_match, deconv, sparc_galaxy_list, mass_mode
         Rvir = matched_halos[j]['Rvir'] / 0.7
         rs = matched_halos[j]['rs'] / 0.7
 
-        V_dm_direct = nfw_circular_velocity(rads, Mvir, Rvir, rs)
+        if NU == 0.0:
+            # the case of no halo contraction/expansion, use basic NFW profile
+            V_dm = nfw_circular_velocity(rads, Mvir, Rvir, rs)
         
-        V_dm = nfw_circular_velocity_contra(rads, Eff_rads[j], Rvir, rs, Mvir, M_baryon)
+        else:
+            # the case of halo contraction/expansion, use contra emulator
+            V_dm = nfw_circular_velocity_contra(rads, Eff_rads[j], Rvir, rs, Mvir, M_baryon, emulator)
 
-        print(f"V_dm_direct: {V_dm_direct}")
-        print(f"V_dm: {V_dm}")
-
-        exit()
+        # Write the V_dm as a line into a txt file
+        with open("/Users/fedorboreiko/Documents/Oxford/btfr_z/btfr/V_dm_output.txt", "a") as f:
+            f.write(f"{galaxy}: {V_dm.flatten().tolist()}\n")
  
         # Calculate the maximum circular velocity of the galaxy's total rotation curve
         V_max = np.sqrt(np.max(
@@ -203,10 +144,6 @@ def compute_AM_realization(abundance_match, deconv, sparc_galaxy_list, mass_mode
                                 V_dm * np.abs(V_dm),
                                 axis=1
                             )) # km/s
-        
-        # handle cases where V_dm is an array of zeros
-        V_dm_max = np.max(V_dm, axis=1)
-        V_max[V_dm_max == 0] = 0
 
         vels[j, :] = V_max
         masses[j, :] = M_baryon
@@ -219,16 +156,14 @@ def compute_AM_realization(abundance_match, deconv, sparc_galaxy_list, mass_mode
                                     axis=1
                                 )) # km/s
         
-        V_bar_max[V_dm_max == 0] = 0
-
-        dm_vels[j, :] = V_dm_max
+        dm_vels[j, :] = np.max(V_dm, axis=1)
         bar_vels[j, :] = V_bar_max
     
-    selection_mask = matched_halos['select']
-    vels *= selection_mask
-    masses *= selection_mask
-    dm_vels *= selection_mask
-    bar_vels *= selection_mask
+    #selection_mask = matched_halos['select']
+    #vels *= selection_mask
+    #masses *= selection_mask
+    #dm_vels *= selection_mask
+    #bar_vels *= selection_mask
 
     return vels, masses, dm_vels, bar_vels
 
@@ -264,13 +199,13 @@ if rank == 0:
     halos = np.load("/Users/fedorboreiko/Documents/Oxford/Personal_codes/Codebase/halos_z_0p00.npy")
 
     # Implement halo selection on the halo catalog
-    slope, intercept = get_x_cutoff_fit(halos, X)
+    '''slope, intercept = get_x_cutoff_fit(halos, X)
     halos_selected = halos.copy()
-    halos_selected = rfn.append_fields(halos_selected, 'select', np.ones(halos.shape[0], dtype=int), usemask=False)
+    halos_selected = rfn.append_fields(halos_selected, 'select', np.ones(halos.shape[0], dtype=float), usemask=False)
     halo_log_Mvir = np.log10(halos_selected['Mvir'])
     halo_log_vmax = np.log10(halos_selected['vmax'])
     predicted_log_vmax = slope * halo_log_Mvir + intercept
-    halos_selected['select'][halo_log_vmax > predicted_log_vmax] = 0
+    halos_selected['select'][halo_log_vmax > predicted_log_vmax] = np.nan'''
 
     # Create abundance matching (AM) object
     proxy = proxies["mvir_proxy"](use_cache=False)
@@ -279,7 +214,7 @@ if rank == 0:
 
     theta = {"alpha": ALPHA, "scatter": SCATTER}  # AM model parameters
     # Deconvolute the AM catalog
-    deconv = abundance_match.deconvoluted_catalogs(theta, halos_selected)
+    deconv = abundance_match.deconvoluted_catalogs(theta, halos)
 
     # Instead of loading a pre-trained interpolator, load grids and then build the jax-based callable.
     try:
@@ -341,7 +276,6 @@ L_bulges = comm.bcast(L_bulges, root=0)
 abundance_match = comm.bcast(abundance_match, root=0)
 deconv = comm.bcast(deconv, root=0)
 halos = comm.bcast(halos, root=0)
-halos_selected = comm.bcast(halos_selected, root=0)
 contra_interpolator = comm.bcast(contra_interpolator, root=0)
 
 log_c_grid  = np.linspace(0, 3.9, N_SAMPLES)
@@ -367,7 +301,7 @@ if rank == 0:
 
 for i, realization in enumerate(local_realizations):
 
-    vels, masses, dm_vels, bar_vels = compute_AM_realization(abundance_match, deconv, sparc_galaxy_list, mass_models, halos_selected, 
+    vels, masses, dm_vels, bar_vels = compute_AM_realization(abundance_match, deconv, sparc_galaxy_list, mass_models, halos, 
                                                              L_bulges, L_36_means, L_36_errors, Eff_radii, MH1_means, MH1_errors, 
                                                              dists, dists_err, contra_interpolator)
     local_vels[i, :, :] = vels
@@ -410,26 +344,19 @@ if rank == 0:
     global_dm_vels_reshaped = np.transpose(global_dm_vels, (1, 0, 2))
     global_bar_vels_reshaped = np.transpose(global_bar_vels, (1, 0, 2))
 
-    def filter_zeros(arr):
-        #Filters out zeros from a 2D array row-wise, returning a list of arrays.
-        return [row[row != 0] for row in arr]
+    V_mocks = np.log10(global_vels_reshaped.reshape(len(galaxy_sample), -1))
 
-    V_mocks_unlogged = filter_zeros(global_vels_reshaped.reshape(len(galaxy_sample), -1))
-    V_mocks = [np.log10(row) for row in V_mocks_unlogged]
-
-    V_dm_mocks_unlogged = filter_zeros(global_dm_vels_reshaped.reshape(len(galaxy_sample), -1))
-    V_bar_mocks_unlogged = filter_zeros(global_bar_vels_reshaped.reshape(len(galaxy_sample), -1))
-    V_dm_mocks = [np.log10(row) for row in V_dm_mocks_unlogged]
-    V_bar_mocks = [np.log10(row) for row in V_bar_mocks_unlogged]
+    V_dm_mocks = np.log10(global_dm_vels_reshaped.reshape(len(galaxy_sample), -1))
+    V_bar_mocks = np.log10(global_bar_vels_reshaped.reshape(len(galaxy_sample), -1))
 
     # Print the percentages
     original_length = N_AM_REALS * N_STELLAR_REALS
-    filtered_lengths = [len(row) for row in V_mocks_unlogged]
+    filtered_lengths = [np.count_nonzero(~np.isnan(row)) for row in V_mocks]
     print("Percentage of original array length retained after filtering out-of-bound points (per galaxy):")
     print([round((length / original_length) * 100, 2) for length in filtered_lengths])
 
-    V_mock = np.array([np.mean(row) for row in V_mocks])
-    V_mock_err = np.array([np.std(row) for row in V_mocks])
+    V_mock = np.array([np.nanmean(row) for row in V_mocks])
+    V_mock_err = np.array([np.nanstd(row) for row in V_mocks])
 
     # Observed data
     V_obs_unlogged = np.array(sparc_btfr['Vmax'])
@@ -443,11 +370,10 @@ if rank == 0:
     print(f'Log likelihood: {log_likelihood}')
 
     # Plot the BTFR
-    M_mocks_unlogged = filter_zeros(global_masses_reshaped.reshape(len(galaxy_sample), -1))
-    M_mocks = [np.log10(row) for row in M_mocks_unlogged]
+    M_mocks = np.log10(global_masses_reshaped.reshape(len(galaxy_sample), -1))
 
-    M_mock = np.array([np.mean(row) for row in M_mocks])
-    M_mock_err = np.array([np.std(row) for row in M_mocks])
+    M_mock = np.array([np.nanmean(row) for row in M_mocks])
+    M_mock_err = np.array([np.nanstd(row) for row in M_mocks])
 
     M_obs = np.array(sparc_btfr['log(Mb)'])
     M_obs_err = np.array(sparc_btfr['e_log(Mb)'])

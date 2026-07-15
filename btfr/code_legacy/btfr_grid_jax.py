@@ -20,8 +20,8 @@ import h5py
 
 jax.config.update("jax_enable_x64", True)
 
-N_AM_REALS = 5
-N_STELLAR_REALS = 100
+N_AM_REALS = 100
+N_STELLAR_REALS = 10000
 
 M2L_DISK_MEAN = 0.5
 M2L_DISK_ERROR = 0.2 # dex
@@ -327,6 +327,10 @@ if __name__ == "__main__":
                     if likelihood is not None:
                         likelihood_grid[i_alpha, i_scatter, i_x, i_nu] = likelihood
                         pbar.update(1)
+
+                        print(f"Computed likelihood for alpha={alpha:.3f}, scatter={scatter:.3f}, x={x:.3f}, nu={nu:.3f}: {likelihood:.6f}")
+
+                        exit()
 
         del halos_selected
 

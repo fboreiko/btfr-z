@@ -10,13 +10,31 @@ rcParams['font.serif'] = ['Computer Modern']
 rcParams['text.usetex'] = True
 
 # Define radii and other parameters
-ri = np.logspace(-9, 1, 30)
+ri = np.logspace(-3, 2, 30)
 
-# Combinations of concentration, baryonic fraction, and scale radius
-concs = np.array([6.250551925273973])
-fbs = np.array([0.7891196485223975]) 
-rbs = np.array([0.0013257113655901094]) 
-nu = -3.0 #0.28
+halos = np.load("/Users/fedorboreiko/Documents/Oxford/Personal_codes/Codebase/halos_z_0p00.npy")
+
+random_index = 150000
+halo = halos[random_index]
+
+Mvir = halo['Mvir'] / 0.7
+Rvir = halo['Rvir'] / 0.7
+rs = halo['rs'] / 0.7
+
+Reff = 5
+Mbar = 1e10
+
+rb = Reff / 1.67835
+c = Rvir / rs
+fb = Mbar / (Mvir + Mbar)
+rb_uless = rb / Rvir
+ri_uless = ri / Rvir
+nu = -1.0
+
+print(rb_uless)
+
+exit()
+
 
 #how to find the upper bound? find the local maxima of this plot here. First, take the maxima corresponding to the 
 #lowest ri value. 
@@ -26,34 +44,44 @@ nu = -3.0 #0.28
 # Prepare the plot
 plt.figure(figsize=(8, 6), dpi=300)
 
-# Loop through each combination
-for i in range(len(concs)):
-    for j in range(len(fbs)):
-        for k in range(len(rbs)):
-            c = concs[i]
-            fb = fbs[j]
-            rb = rbs[k]
-            
-            # Compute the initial and final dark matter mass fractions
-            rf, mhi = do_contra(ri, c, fb, rb, A=1.6, w=0.8)
+# Compute the initial and final dark matter mass fractions
+rf, mhi = do_contra(ri_uless, c, fb, rb_uless, A=1.6, w=0.8)
 
-            rf = (rf / ri)**(nu) * ri
+print('Pre contraction radii:', ri_uless)
+print('Post contraction radii:', rf)
 
-            # find local maxima of the plot
-            mask = rf > 10**(-4.1755102040816325)
-            if np.any(mask):
-                upper_bound = ri[np.argmax(mask)]
+exit()
 
-            # Find local maxima in rf_probe_array
-            peaks, _ = find_peaks(rf)  
 
-            print(10**(-4.1755102040816325) < rf[peaks[0]])     
-            
-            # Plot the result
-            plt.plot(ri, rf, label=f'(c = {c:.4f}, fb = {fb:.4f}, rb = {rb:.4f})', linewidth=2)
-            plt.scatter(ri[peaks], rf[peaks], color='r', s=50, label='local maxima')
-            plt.hlines(10**(-4.1755102040816325), 10**(-8.5), 10, colors='k', linestyles='dashed', linewidth=1)
-            plt.vlines(10**(-7), 1e-7, 10, colors='k', linestyles='dashed', linewidth=1)
+"""Post contraction radii: [1.37411178e-05 2.04329033e-05 3.03807688e-05 4.51662026e-05
+ 6.71358878e-05 9.97689342e-05 1.48217321e-04 2.20098269e-04
+ 3.26650193e-04 4.84408151e-04 7.17612165e-04 1.06163393e-03
+ 1.56779562e-03 2.31006563e-03 3.39427829e-03 4.97082737e-03
+ 7.25245674e-03 1.05403244e-02 1.52649687e-02 2.20561827e-02
+ 3.18714841e-02 4.62472251e-02 6.78133528e-02 1.01368378e-01
+ 1.55938996e-01 2.47285926e-01 3.97607255e-01 6.35255659e-01
+ 1.00302981e+00 1.56780967e+00]"""
+
+
+
+
+rf = (rf / ri_uless)**(nu) * ri_uless
+
+# find local maxima of the plot
+mask = rf > 10**(-4.1755102040816325)
+if np.any(mask):
+    upper_bound = ri[np.argmax(mask)]
+
+# Find local maxima in rf_probe_array
+peaks, _ = find_peaks(rf)  
+
+print(10**(-4.1755102040816325) < rf[peaks[0]])     
+
+# Plot the result
+plt.plot(ri, rf, label=f'(c = {c:.4f}, fb = {fb:.4f}, rb = {rb:.4f})', linewidth=2)
+plt.scatter(ri[peaks], rf[peaks], color='r', s=50, label='local maxima')
+plt.hlines(10**(-4.1755102040816325), 10**(-8.5), 10, colors='k', linestyles='dashed', linewidth=1)
+plt.vlines(10**(-7), 1e-7, 10, colors='k', linestyles='dashed', linewidth=1)
     
 # Set the x-axis to logarithmic scale
 plt.xscale('log')

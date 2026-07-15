@@ -11,9 +11,9 @@ rank = comm.Get_rank()
 size = comm.Get_size()
 
 # Parameters
-nu_values = np.linspace(-3.0, 3.0, 31)
-nu_values = np.round(nu_values, 1)
-num_samples = 1000  # Number of test points per emulator
+nu_values = np.linspace(-1.0, 1.5, 40)
+#nu_values = np.round(nu_values, 1)
+num_samples = 100  # Number of test points per emulator
 
 # Define parameter ranges
 log_c_range = [0.5, 2.2]
@@ -21,7 +21,7 @@ log_fb_range = [-2.5, -1]
 log_rb_range = [-2.5, -1.6]
 log_rf_range = [-4, 0]
 
-with open("/Users/fedorboreiko/Documents/Oxford/btfr_z/contra/contra_emulators/contra_interpolators.pkl", "rb") as f:
+with open("/Users/fedorboreiko/Documents/Oxford/Personal_codes/Codebase/contra_emulators/grids_fullrange.pkl", "rb") as f:
     interpolators = pickle.load(f)
 
 # Distribute emulators among available MPI processes

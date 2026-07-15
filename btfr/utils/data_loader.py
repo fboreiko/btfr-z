@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 import pickle
 import sys
-from utils.massfuncs import get_GSMF_ELPETRO
+from .massfuncs import get_GSMF_ELPETRO
 
 
 def load_csv_data(file_path, filter_column=None, filter_values=None):
@@ -75,6 +75,42 @@ def load_data():
         stellar_mass_function,
         halo_catalog,
     )
+
+
+def vectorize_mass_model_table(sparc_galaxy_names, mass_model_table):
+    """
+    Vectorize the mass model table for efficient processing.
+
+    Args:
+        sparc_galaxy_names (list): List of galaxy names in the SPARC sample.
+        mass_model_table (pd.DataFrame): The original mass model table.
+
+    Returns:
+        dict: A dictionary containing the vectorized mass model data with keys:
+              'R', 'Vgas', 'Vdisk', 'Vbul' - each containing 2D arrays of shape 
+              (n_galaxies, max_entries) padded with NaNs where needed.
+    """
+    # Determine the maximum number of radial entries across all galaxies
+    entries_per_galaxy = mass_model_table.groupby('ID').size()
+    max_entries = entries_per_galaxy.max()
+    
+    # Initialize arrays to store the vectorized data
+    columns = ['R', 'Vgas', 'Vdisk', 'Vbul']
+    mass_models_vectorized = {}
+    
+    for column in columns:
+        mass_models_vectorized[column] = np.full((len(sparc_galaxy_names), max_entries), np.nan)
+
+    # Fill the vectorized arrays with actual data, padding with NaNs where needed
+    for i, galaxy in enumerate(sparc_galaxy_names):
+        galaxy_data = mass_model_table[mass_model_table['ID'] == galaxy]
+        n_entries = len(galaxy_data)
+        
+        if n_entries > 0:
+            for column in columns:
+                mass_models_vectorized[column][i, :n_entries] = galaxy_data[column].values
+    
+    return mass_models_vectorized
 
 
 def load_emulators():

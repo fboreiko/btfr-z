@@ -1,4 +1,5 @@
 import sys
+import os
 sys.path.append('/Users/fedorboreiko/Documents/Oxford/btfr_z')
 
 import numpy as np
@@ -28,21 +29,32 @@ rcParams['text.usetex'] = True
 N_AM_REALS = 100
 N_STELLAR_REALS = 1000
 
-SCATTER_1 = 0.01
-ALPHA_1 = -100
-X_1 = 0.36
-NU_1 = np.linspace(-3.0, 3.0, 20)[13]
-SCATTER_2 = 0.01
-ALPHA_2 = -100
-X_2 = 0.35
-NU_2 = np.linspace(-3.0, 3.0, 20)[5]
-VMAXSHIFT = True
+SCATTER_1 = 0.1
+ALPHA_PROXY_1 = 0.5
+X_1 = 0.0
+NU_1 = np.linspace(-3.0, 3.0, 20)[11]
+
+SCATTER_2 = 0.1
+ALPHA_PROXY_2 = 0.5
+X_2 = 0.0
+NU_2 = np.linspace(-3.0, 3.0, 20)[15]
+
+VMAXSHIFT = False
+
+ALPHA_1 = np.tan(ALPHA_PROXY_1)
+ALPHA_2 = np.tan(ALPHA_PROXY_2)
 
 M2L_DISK_MEAN = 0.5
 M2L_DISK_ERROR = 0.2 # dex
 
 M2L_BULGE_MEAN = 0.7
 M2L_BULGE_ERROR = 0.2 # dex
+
+# Add configuration for data paths
+DATA_DIR = os.environ.get('BTFR_DATA_DIR', '/Users/fedorboreiko/Documents/Oxford/Personal_codes/Codebase')
+HALOS_FILE = os.path.join(DATA_DIR, 'halos_z_0p00.npy')
+CONTRA_EMULATOR_DIR = os.path.join(DATA_DIR, 'contra_emulators')
+CONTRA_GRIDS_FILE = os.path.join(CONTRA_EMULATOR_DIR, 'grids_fullrange.pkl')
 
 # Pre-load data
 bulge_lumins = pd.read_csv('Tabular_data/Bulge_lum_table.csv')
@@ -59,8 +71,9 @@ galaxy_sample = galaxy_sample[galaxy_sample['Galaxy'].isin(sparc_galaxy_list)]
 @partial(jax.jit, static_argnames=("order",))
 def jax_contra_interpolator(grid, positions, grid_axes, order=1):
     """
-    A thin wrapper that converts the grid and query points into JAX arrays,
-    performs interpolation, and applies a validity mask to handle out-of-bounds points.
+    A thin wrapper that converts the contra grid and query points into JAX arrays,
+    performs interpolation, and applies a validity mask to handle out-of-bounds points
+    by setting the log(mhi) value to nans.
     """
     indices = []
     valid_mask = jnp.ones(positions.shape[0], dtype=bool)  # Start with all points valid
@@ -75,7 +88,7 @@ def jax_contra_interpolator(grid, positions, grid_axes, order=1):
 
     coords = jnp.stack(indices, axis=0)  # shape: (dimensions, n_points)
     interpolated_values = map_coordinates(grid, coords, order=order, mode='constant', cval=0)
-    return interpolated_values * valid_mask
+    return jnp.where(valid_mask, interpolated_values, jnp.nan)
 
 def load_data(galaxy):
     #Loads the data for a given galaxy.
@@ -109,7 +122,7 @@ def forward_model_btfr(alpha, scatter, x, nu, vmaxshift=False):
     log_stellar_masses, SMF_data, _ = get_GSMF_ELPETRO(plotting=False)
 
     # Load the Uchuu halos 
-    halos = np.load("/Users/fedorboreiko/Documents/Oxford/Personal_codes/Codebase/halos_z_0p00.npy")
+    halos = np.load(HALOS_FILE)
 
     slope, intercept = get_x_cutoff_fit(halos, x)
     halos_selected = halos.copy()
@@ -117,22 +130,21 @@ def forward_model_btfr(alpha, scatter, x, nu, vmaxshift=False):
     halo_log_Mvir = np.log10(halos_selected['Mvir'])
     halo_log_vmax = np.log10(halos_selected['vmax'])
     predicted_log_vmax = slope * halo_log_Mvir + intercept
-    halos_selected['select'][halo_log_vmax > predicted_log_vmax] = 0
+    halos_selected['select'][halo_log_vmax > predicted_log_vmax] = np.nan
 
     proxy = proxies["mvir_proxy"](use_cache=False)
-
     abundance_match = AbundanceMatch(log_stellar_masses[10:], SMF_data[10:], halo_proxy=proxy, ext_range=(3.0, 12.0),
                                         boxsize=140, faint_end_first=True, scatter_mult=1, faint_end_slope=-0.42)
     
-    theta = {"alpha": alpha, "scatter": scatter}  # Will be tuned?
+    theta = {"alpha": alpha, "scatter": scatter}  # AM model parameters
     deconv = abundance_match.deconvoluted_catalogs(theta, halos_selected)
 
     # Instead of loading a pre-trained interpolator, load grids and then build the jax-based callable.
     try:
-        with open("/Users/fedorboreiko/Documents/Oxford/Personal_codes/Codebase/contra_emulators/grids_fullrange.pkl", "rb") as f:
+        with open(CONTRA_GRIDS_FILE, "rb") as f:
             contra_grids = pickle.load(f)
     except FileNotFoundError:
-        print("Error: Contra emulator grids were not found. Please run the grid-generation script first.")
+        print(f"Error: Contra emulator grids were not found at {CONTRA_GRIDS_FILE}. Please run the grid-generation script first.")
         sys.exit(1)
 
     # Define grid axes matching the interpolation grid-generation stage.
@@ -239,7 +251,7 @@ def forward_model_btfr(alpha, scatter, x, nu, vmaxshift=False):
 
     def filter_zeros(arr):
         #Filters out zeros from a 2D array row-wise, returning a list of arrays.
-        return [row[row != 0] for row in arr]
+        return [row[row != np.nan] for row in arr]
 
     V_mocks_unlogged = filter_zeros(vels_global.reshape(len(galaxy_sample), -1))
 
@@ -376,21 +388,21 @@ fig, axs = plt.subplots(3, 2, figsize=(14, 15))
 V_mock_1, V_mock_err_1, M_mock_1, M_mock_err_1, V_obs_1, V_obs_err_1, M_obs_1, M_obs_err_1, halo_proxy_1, catalog_1, residuals_1, log_likelihood_1, log_likelihoods_1 = forward_model_btfr(alpha=ALPHA_1, scatter=SCATTER_1, x=X_1, nu=NU_1, vmaxshift=VMAXSHIFT)
 btfr_plot(M_mock_1, V_mock_1, M_mock_err_1, V_mock_err_1, M_obs_1, V_obs_1, M_obs_err_1, V_obs_err_1, axs[0, 0])
 if VMAXSHIFT:
-    axs[0, 0].set_title(fr'BTFR with $\alpha={ALPHA_1}$, $\sigma={SCATTER_1}$, x={X_1}, $\nu={NU_1:.2f}$, VS, Loglike {log_likelihood_1:.2f}', fontsize=16)
+    axs[0, 0].set_title(fr'BTFR with $\alpha={ALPHA_1:.2f}$, $\sigma={SCATTER_1}$, x={X_1}, $\nu={NU_1:.2f}$, VS, Loglike {log_likelihood_1:.2f}', fontsize=16)
 else:
-    axs[0, 0].set_title(fr'BTFR with $\alpha={ALPHA_1}$, $\sigma={SCATTER_1}$, x={X_1}, $\nu={NU_1:.2f}$, Loglike {log_likelihood_1:.2f}', fontsize=16)
+    axs[0, 0].set_title(fr'BTFR with $\alpha={ALPHA_1:.2f}$, $\sigma={SCATTER_1}$, x={X_1}, $\nu={NU_1:.2f}$, Loglike {log_likelihood_1:.2f}', fontsize=16)
 
 # Plot for alpha2, scatter2, nu2
 V_mock_2, V_mock_err_2, M_mock_2, M_mock_err_2, V_obs_2, V_obs_err_2, M_obs_2, M_obs_err_2, halo_proxy_2, catalog_2, residuals_2, log_likelihood_2, log_likelihoods_2 = forward_model_btfr(alpha=ALPHA_2, scatter=SCATTER_2, x=X_2, nu=NU_2, vmaxshift=VMAXSHIFT)
 btfr_plot(M_mock_2, V_mock_2, M_mock_err_2, V_mock_err_2, M_obs_2, V_obs_2, M_obs_err_2, V_obs_err_2, axs[0, 1])
 if VMAXSHIFT:
-    axs[0, 1].set_title(fr'BTFR with $\alpha={ALPHA_2}$, $\sigma={SCATTER_2}$, x={X_2}, $\nu={NU_2:.2f}$, VS, Loglike {log_likelihood_2:.2f}', fontsize=16)
+    axs[0, 1].set_title(fr'BTFR with $\alpha={ALPHA_2:.2f}$, $\sigma={SCATTER_2}$, x={X_2}, $\nu={NU_2:.2f}$, VS, Loglike {log_likelihood_2:.2f}', fontsize=16)
 else:
-    axs[0, 1].set_title(fr'BTFR with $\alpha={ALPHA_2}$, $\sigma={SCATTER_2}$, x={X_2}, $\nu={NU_2:.2f}$, Loglike {log_likelihood_2:.2f}', fontsize=16)
+    axs[0, 1].set_title(fr'BTFR with $\alpha={ALPHA_2:.2f}$, $\sigma={SCATTER_2}$, x={X_2}, $\nu={NU_2:.2f}$, Loglike {log_likelihood_2:.2f}', fontsize=16)
 
 # SHMR Plot
-plot_SHMR_with_contours_quantile(axs[1, 0], halo_proxy_1, catalog_1, color='purple', label=fr'$\alpha={ALPHA_1}$, $\sigma={SCATTER_1}$, x={X_1}, $\nu={NU_1:.2f}$')
-plot_SHMR_with_contours_quantile(axs[1, 0], halo_proxy_2, catalog_2, color='orange', label=fr'$\alpha={ALPHA_2}$, $\sigma={SCATTER_2}$, x={X_2}, $\nu={NU_2:.2f}$')
+plot_SHMR_with_contours_quantile(axs[1, 0], halo_proxy_1, catalog_1, color='purple', label=fr'$\alpha={ALPHA_1:.2f}$, $\sigma={SCATTER_1}$, x={X_1}, $\nu={NU_1:.2f}$')
+plot_SHMR_with_contours_quantile(axs[1, 0], halo_proxy_2, catalog_2, color='orange', label=fr'$\alpha={ALPHA_2:.2f}$, $\sigma={SCATTER_2}$, x={X_2}, $\nu={NU_2:.2f}$')
 axs[1, 0].set_ylabel(r'$\log_{10}(M_*/M_h)$', fontsize=12) 
 axs[1, 0].set_xlabel(r'$\log_{10}(M_h (M_\odot))$', fontsize=12) 
 axs[1, 0].set_title("Stellar-to-Halo Mass Relations", fontsize=16)
@@ -399,8 +411,8 @@ axs[1, 0].set_ylim([7, 12])
 axs[1, 0].legend()
 
 # Plot Residuals vs Mmocks
-scatter_residuals_vs_mocks(axs[1, 1], M_mock_1, residuals_1, color='purple', label=fr'$\alpha={ALPHA_1}$, $\sigma={SCATTER_1}$, x={X_1}, $\nu={NU_1:.2f}$')
-scatter_residuals_vs_mocks(axs[1, 1], M_mock_2, residuals_2, color='orange', label=fr'$\alpha={ALPHA_2}$, $\sigma={SCATTER_2}$, x={X_2}, $\nu={NU_2:.2f}$')
+scatter_residuals_vs_mocks(axs[1, 1], M_mock_1, residuals_1, color='purple', label=fr'$\alpha={ALPHA_1:.2f}$, $\sigma={SCATTER_1}$, x={X_1}, $\nu={NU_1:.2f}$')
+scatter_residuals_vs_mocks(axs[1, 1], M_mock_2, residuals_2, color='orange', label=fr'$\alpha={ALPHA_2:.2f}$, $\sigma={SCATTER_2}$, x={X_2}, $\nu={NU_2:.2f}$')
 
 # Plot Loglikes vs Mocks
 delta_loglike = log_likelihoods_2 - log_likelihoods_1
@@ -411,3 +423,4 @@ if VMAXSHIFT:
     plt.savefig('/Users/fedorboreiko/Documents/Oxford/btfr_z/plots/btfr_panel_vmaxshift.png', dpi=300)
 else:
     plt.savefig('/Users/fedorboreiko/Documents/Oxford/btfr_z/plots/btfr_panel.png', dpi=300)
+    plt.show()

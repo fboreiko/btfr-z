@@ -7,10 +7,9 @@ from mpi4py import MPI
 import numpy as np
 from numpy.lib import recfunctions as rfn
 import pandas as pd
-from btfr.utils.massfuncs import get_GSMF_ELPETRO
+from utils import *
 from BAM import AbundanceMatch, proxies
-from btfr.utils.plotting_utils import btfr_plot, explore_hist
-from btfr.btfr_utils import get_x_cutoff_fit, nfw_circular_velocity_contra, nfw_circular_velocity, get_loglike
+from btfr_utils import get_x_cutoff_fit, nfw_circular_velocity_contra, nfw_circular_velocity_contra_vect, nfw_circular_velocity, nfw_circular_velocity_vect, get_loglike
 from matplotlib import rcParams
 import matplotlib.pyplot as plt
 from tqdm import tqdm
@@ -27,13 +26,15 @@ rcParams['font.family'] = 'serif'
 rcParams['font.serif'] = ['Computer Modern']
 rcParams['text.usetex'] = True
 
-N_AM_REALS = 10
+N_AM_REALS = 100
 N_STELLAR_REALS = 1000
 
-ALPHA = -2
-SCATTER = 0.01
-X = 0.6
-NU = np.linspace(-3.0, 3.0, 20)[10]
+ALPHAPROXY = 0.5
+SCATTER = 0.1
+X = 0.0
+NU = np.linspace(-3.0, 3.0, 20)[11]
+ALPHA = np.tan(ALPHAPROXY)
+VMAX_SHIFT_MODE = False
 
 M2L_DISK_MEAN = 0.5
 M2L_DISK_ERROR = 0.2
@@ -113,9 +114,9 @@ def compute_AM_realization(abundance_match, deconv, sparc_galaxy_list, mass_mode
 
     for j, galaxy in enumerate(sparc_galaxy_list):
         
-        # Extract the galaxy's data
+        # Extract the galaxy's data from vectorized mass models
         selected_rows = mass_models[mass_models['ID'] == galaxy]
-        rads = np.asarray(selected_rows['R']) # kpc
+        rads = np.asarray(selected_rows['R'])  # kpc
         V_gas = np.asarray(selected_rows['Vgas'])
         V_disk = np.asarray(selected_rows['Vdisk'])
         V_bul = np.asarray(selected_rows['Vbul'])
@@ -133,15 +134,15 @@ def compute_AM_realization(abundance_match, deconv, sparc_galaxy_list, mass_mode
         else:
             # the case of halo contraction/expansion, use contra emulator
             V_dm = nfw_circular_velocity_contra(rads, Eff_rads[j], Rvir, rs, Mvir, M_baryon, emulator)
- 
+
         # Calculate the maximum circular velocity of the galaxy's total rotation curve
-        V_max = np.sqrt(np.max(
-                                V_gas * np.abs(V_gas) +
-                                M2L_disk_samples[j][:, np.newaxis] * V_disk * np.abs(V_disk) +
-                                M2L_bulge_samples[j][:, np.newaxis] * V_bul * np.abs(V_bul) +
-                                V_dm * np.abs(V_dm),
-                                axis=1
-                            )) # km/s
+        V_max = np.sqrt(np.nanmax(
+                                    V_gas * np.abs(V_gas) +
+                                    M2L_disk_samples[j][:, np.newaxis] * V_disk * np.abs(V_disk) +
+                                    M2L_bulge_samples[j][:, np.newaxis] * V_bul * np.abs(V_bul) +
+                                    V_dm * np.abs(V_dm),
+                                    axis=1
+                                )) # km/s
 
         vels[j, :] = V_max
         masses[j, :] = M_baryon
@@ -277,14 +278,6 @@ halos = comm.bcast(halos, root=0)
 halos_selected = comm.bcast(halos_selected, root=0)
 contra_interpolator = comm.bcast(contra_interpolator, root=0)
 
-log_c_grid  = np.linspace(0, 3.9, N_SAMPLES)
-log_fb_grid = np.linspace(-3.6, -0.03, N_SAMPLES)
-log_rb_grid = np.linspace(-3, -1, N_SAMPLES)
-log_rf_grid = np.linspace(-4.8, 0.3, N_SAMPLES)
-
-bounds = [[log_c_grid[0], log_c_grid[-1]], [log_fb_grid[0], log_fb_grid[-1]],
-            [log_rb_grid[0], log_rb_grid[-1]], [log_rf_grid[0], log_rf_grid[-1]]]
-
 # Split the realizations across processes
 realizations_per_process = np.array_split(np.arange(N_AM_REALS), size)
 local_realizations = realizations_per_process[rank]
@@ -364,7 +357,18 @@ if rank == 0:
     V_obs = np.log10(V_obs_unlogged)
     V_obs_err = V_obs_err_unlogged / (V_obs_unlogged * np.log(10))
 
-    log_likelihood, _ = get_loglike(V_mocks, V_obs, V_obs_err)
+    # Mean velocity shift mode
+    if VMAX_SHIFT_MODE:
+        mean_V_obs = np.mean(V_obs)
+        mean_V_mocks = np.nanmean(V_mocks)
+        shift = mean_V_obs - mean_V_mocks
+        V_mocks_mode = V_mocks + shift
+        V_mock_mode = V_mock + shift
+    else:
+        V_mocks_mode = V_mocks
+        V_mock_mode = V_mock
+
+    log_likelihood, _ = get_loglike(V_mocks_mode, V_obs, V_obs_err)
 
     print(f'Log likelihood: {log_likelihood}')
 
@@ -382,10 +386,14 @@ if rank == 0:
     if indiv_hists:
         for galnum in range(len(sparc_galaxy_list)):
 
-            explore_hist(V_mocks[galnum], V_dm_mocks[galnum], V_bar_mocks[galnum],
-                        V_mock[galnum], V_mock_err[galnum],
+            vels_hist(V_mocks_mode[galnum], V_dm_mocks[galnum], V_bar_mocks[galnum],
+                        V_mock_mode[galnum], V_mock_err[galnum],
                         V_obs[galnum], V_obs_err[galnum],
                         M_mock[galnum], 10, 10, 
                         f'/Users/fedorboreiko/Documents/Oxford/btfr_z/plots/RTstats_alpha_{ALPHA}_scatter_{SCATTER}_x{X}_nu_{NU}/RTstats_galaxy_{galnum}_alpha_{ALPHA}_scatter_{SCATTER}_nu_{NU:.3f}.png')
 
-    btfr_plot(log_likelihood, V_mock, M_mock, V_mock_err, M_mock_err, V_obs, M_obs, V_obs_err, M_obs_err, plotname=f'/Users/fedorboreiko/Documents/Oxford/btfr_z/plots/btfr_alpha_{ALPHA}_scatter_{SCATTER}_x_{X}_nu_{NU:.3f}.png')
+    btfr_plot(alpha=ALPHA, sigma=SCATTER, x=X, nu=NU, vmaxshift=False, loglike=log_likelihood, 
+              xsim=V_mock_mode, ysim=M_mock, xsimerr=V_mock_err, ysimerr=M_mock_err, 
+              xobs=V_obs, yobs=M_obs, xobserr=V_obs_err, yobserr=M_obs_err, 
+              plotname=f'/Users/fedorboreiko/Documents/Oxford/btfr_z/plots/btfr_alpha_{ALPHA:.3f}_scatter_{SCATTER}_x_{X}_nu_{NU:.3f}.png',
+              ax=None)
