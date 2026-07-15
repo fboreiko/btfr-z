@@ -8,7 +8,7 @@ import pandas as pd
 from btfr.utils.massfuncs import get_GSMF_ELPETRO
 from BAM import AbundanceMatch, proxies
 from btfr.utils.plotting_utils import btfr_plot, explore_hist
-from btfr.btfr_utils import get_x_cutoff_fit, nfw_circular_velocity_contra, nfw_circular_velocity, get_loglike
+from btfr.code_legacy.btfr_utils import get_x_cutoff_fit, nfw_circular_velocity_contra, nfw_circular_velocity, get_loglike
 from matplotlib import rcParams
 import matplotlib.pyplot as plt
 from tqdm import tqdm

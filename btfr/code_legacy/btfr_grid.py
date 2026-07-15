@@ -11,7 +11,7 @@ from numpy.lib import recfunctions as rfn
 import pandas as pd
 from btfr.utils.massfuncs import get_GSMF_ELPETRO
 from BAM import AbundanceMatch, proxies
-from btfr.btfr_utils import nfw_circular_velocity, nfw_circular_velocity_contra, get_loglike
+from btfr.code_legacy.btfr_utils import nfw_circular_velocity, nfw_circular_velocity_contra, get_loglike
 from tqdm import tqdm
 import pickle
 
