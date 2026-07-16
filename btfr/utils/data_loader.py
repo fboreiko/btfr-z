@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 import pickle
 import sys
-from .massfuncs import get_GSMF_ELPETRO
+from .mass_functions import get_GSMF_ELPETRO
 
 
 def load_csv_data(file_path, filter_column=None, filter_values=None):

@@ -16,7 +16,7 @@ from .data_loader import (
 )
 
 # Mass function utilities
-from .massfuncs import (
+from .mass_functions import (
     GSMF,
     get_GSMF_Adams,
     get_GSMF_Bernardi,
@@ -40,7 +40,7 @@ from .halo_selection_utils import (
 )
 
 # Interpolation utilities
-from .interpolation_utils import (
+from .emulator import (
     jax_contra_interpolator
 )
 

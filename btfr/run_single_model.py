@@ -27,7 +27,7 @@ from matplotlib import rcParams
 
 from BAM import AbundanceMatch, proxies
 from utils import *
-from likelihood_computation_grid_jax import (
+from btfr.forward_model import (
     compute_simulated_diagnostics,
     evaluate_likelihoods,
 )
