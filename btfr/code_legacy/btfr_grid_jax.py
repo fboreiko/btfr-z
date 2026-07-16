@@ -7,9 +7,9 @@ from mpi4py import MPI
 import numpy as np
 from numpy.lib import recfunctions as rfn
 import pandas as pd
-from btfr.utils.massfuncs import get_GSMF_ELPETRO
+from btfr.code_legacy.utils_legacy.massfuncs import get_GSMF_ELPETRO
 from BAM import AbundanceMatch, proxies
-from utils import *
+from btfr.code_legacy.utils_legacy import *
 from tqdm import tqdm
 import pickle
 import jax

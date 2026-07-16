@@ -9,7 +9,7 @@ from mpi4py import MPI
 import numpy as np
 from numpy.lib import recfunctions as rfn
 import pandas as pd
-from btfr.utils.massfuncs import get_GSMF_ELPETRO
+from btfr.code_legacy.utils_legacy.massfuncs import get_GSMF_ELPETRO
 from BAM import AbundanceMatch, proxies
 from btfr.code_legacy.btfr_utils import nfw_circular_velocity, nfw_circular_velocity_contra, get_loglike
 from tqdm import tqdm

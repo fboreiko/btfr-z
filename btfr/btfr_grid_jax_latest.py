@@ -22,7 +22,7 @@ from mpi4py import MPI
 from tqdm import tqdm
 
 from BAM import AbundanceMatch, proxies
-from utils import *
+from btfr.utils import *
 from likelihood_computation_grid_jax import compute_likelihood
 
 @dataclass
@@ -82,8 +82,6 @@ class SparcLikelihoodGrid:
 
         # Load contra emulator grids
         self.contra_grids, self.grid_axes = load_emulators()
-
-    # -- setup ---------------------------------------------------------------
 
     def _setup_grid_parameters(self):
         """Initialize grid parameter arrays."""

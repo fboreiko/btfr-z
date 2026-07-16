@@ -85,6 +85,36 @@ def vels_hist(vel_sims, veldm_sims, vel_sim_mean, vel_sim_std, vel_obs_mean, vel
     plt.close()
 
 
+def scatter_plot(x, y, xlabel, ylabel, title=None, color='red', output_filename=None, ax=None):
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(8, 6), dpi=300)
+    
+    ax.scatter(x, y, s=10, color=color, alpha=0.7)
+    ax.set_xlabel(xlabel, fontsize=12)
+    ax.set_ylabel(ylabel, fontsize=12)
+    
+    if title is not None:
+        ax.set_title(title, fontsize=14)
+    
+    # Save the plot if a filename is provided and no axes object is passed
+    if output_filename is not None and ax is None:
+        plt.savefig(output_filename, dpi=300)
+        plt.close(fig)
+
+
+def plot_SHMR_with_contours(ax, halo_proxy, stellar_mass, color, label):
+    # Bin data
+    bin_means, bin_edges, binnumber = binned_statistic(np.asarray(halo_proxy).flatten(), np.asarray(stellar_mass).flatten(), statistic='mean', bins=30)
+    bin_std, _, _ = binned_statistic(np.asarray(halo_proxy).flatten(), np.asarray(stellar_mass).flatten(), statistic='std', bins=30)
+    
+    # Bin centers
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+
+    # Plot mean and 1-sigma contours
+    ax.plot(bin_centers, bin_means, color=color, label=label)
+    ax.fill_between(bin_centers, bin_means - bin_std, bin_means + bin_std, color=color, alpha=0.3)
+
+
 def plot_SHMR_with_contours_quantile(ax, halo_proxy, stellar_mass, color, label):
 
     # Define the quantiles you want to calculate
@@ -161,3 +191,110 @@ def delta_loglike_correlation_plot(quantity, delta_loglike, quantity_label, plot
     if plotname is not None:
         plt.savefig(plotname, dpi=300)
         plt.close(fig)
+
+
+def create_btfr_panel_plot(model_1_config, model_1_output, model_2_config, model_2_output, save_path=None):
+    """
+    Create a comprehensive BTFR panel plot from two model outputs.
+
+    Parameters:
+    -----------
+    model_1_config : tuple
+        Configuration parameters for the first model (alpha, scatter, nu).
+    model_1_output : tuple
+        Output data from the first model (V_mock, V_mock_err, M_mock, M_mock_err, 
+        V_obs, V_obs_err, M_obs, M_obs_err, halo_proxy, catalog, residuals, 
+        log_likelihood, log_likelihoods).
+    model_2_config : tuple
+        Configuration parameters for the second model (alpha, scatter, nu).
+    model_2_output : tuple
+        Output data from the second model (V_mock, V_mock_err, M_mock, M_mock_err, 
+        V_obs, V_obs_err, M_obs, M_obs_err, halo_proxy, catalog, residuals, 
+        log_likelihood, log_likelihoods).
+    save_path : str, optional
+        Path to save the figure. If None, uses default naming.
+
+    Returns:
+    --------
+    fig, axs : matplotlib figure and axes objects
+    """
+    
+    # Create the figure and axes for the panel
+    fig, axs = plt.subplots(2, 2, figsize=(14, 10), dpi=300)
+
+    # Unpack model_1_output
+    _, _, _, V_sim_1, V_sim_err_1, M_bar_sim_1, M_bar_sim_err_1, \
+    V_obs, V_obs_err, M_bar_obs, M_bar_obs_err, \
+    AM_catalog_Mstar_1, AM_catalog_Mvir_1, residuals_1, \
+    log_likelihood_1, inidividual_log_likelihoods_1 = model_1_output
+    
+    # Unpack model_2_output
+    _, _, _, V_sim_2, V_sim_err_2, M_bar_sim_2, M_bar_sim_err_2, \
+    _, _, _, _, \
+    AM_catalog_Mstar_2, AM_catalog_Mvir_2, residuals_2, \
+    log_likelihood_2, inidividual_log_likelihoods_2 = model_2_output
+    
+    # Plot BTFR for first parameter set
+    btfr_plot(np.tan(model_1_config.alpha_proxy_value),
+                model_1_config.scatter_value,
+                model_1_config.x_value,
+                model_1_config.nu_value,
+                model_1_config.vmax_shift_mode,
+                log_likelihood_1,
+                V_sim_1, M_bar_sim_1, V_sim_err_1, M_bar_sim_err_1,
+                V_obs, M_bar_obs, V_obs_err, M_bar_obs_err,
+                plotname=None, ax=axs[0, 0])
+    
+    # Plot BTFR for second parameter set
+    btfr_plot(np.tan(model_2_config.alpha_proxy_value),
+                model_2_config.scatter_value,
+                model_2_config.x_value,
+                model_2_config.nu_value,
+                model_2_config.vmax_shift_mode,
+                log_likelihood_2,
+                V_sim_2, M_bar_sim_2, V_sim_err_2, M_bar_sim_err_2,
+                V_obs, M_bar_obs, V_obs_err, M_bar_obs_err,
+                plotname=None, ax=axs[0, 1])
+    
+    # SHMR Plot for first model
+    plot_SHMR_with_contours(axs[1, 0], AM_catalog_Mvir_1, AM_catalog_Mstar_1, 
+                            color='purple', 
+                            label=rf'$\alpha={model_1_config.alpha_proxy_value:.2f}$, $\sigma={model_1_config.scatter_value:.2f}$')
+    # SHMR Plot for second model
+    plot_SHMR_with_contours(axs[1, 0], AM_catalog_Mvir_2, AM_catalog_Mstar_2, 
+                            color='orange', 
+                            label=rf'$\alpha={model_2_config.alpha_proxy_value:.2f}$, $\sigma={model_2_config.scatter_value:.2f}$')
+    
+    axs[1, 0].set_ylabel(r'$\log_{10}(M_*/M_h)$', fontsize=12)
+    axs[1, 0].set_xlabel(r'$\log_{10}(M_h (M_\odot))$', fontsize=12)
+    axs[1, 0].set_title("Stellar-to-Halo Mass Relations", fontsize=16)
+    axs[1, 0].set_xlim([10, 15])
+    axs[1, 0].set_ylim([7, 12])
+    axs[1, 0].legend()
+    
+    """# Plot Residuals vs Mmocks
+    scatter_plot(M_bar_sim_1, residuals_1, 
+                r'$\log_{10}(M_{\rm bar})$', 'Residuals', 
+                title=None, color='red',
+                output_filename=None, ax=axs[1, 1])
+    scatter_plot(M_bar_sim_2, residuals_2,
+                r'$\log_{10}(M_{\rm bar})$', 'Residuals', 
+                title=None, color='blue', 
+                output_filename=None, ax=axs[1, 1])"""
+    
+    # Plot Delta log-likelihoods vs Mocks
+    delta_loglike = inidividual_log_likelihoods_2 - inidividual_log_likelihoods_1
+    delta_loglike_correlation_plot(M_bar_sim_1, delta_loglike, 
+                                   r'$\log_{10}(M_{\rm bar})$', 
+                                   plotname=None, ax=axs[1, 1])
+    
+    # You can add more plots to axs[2, 1] if needed
+    axs[1, 1].axis('off')  # Turn off empty subplot
+    
+    plt.tight_layout()
+    
+    # Save figure
+    if save_path is None:
+        save_path = "btfr_panel_plot.png"
+    
+    plt.savefig(save_path, dpi=300)

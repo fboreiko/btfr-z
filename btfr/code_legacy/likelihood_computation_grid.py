@@ -1,5 +1,5 @@
 import numpy as np
-from utils import *
+from btfr.code_legacy.utils_legacy import *
 from mpi4py import MPI
 
 G = 4.30091e-6

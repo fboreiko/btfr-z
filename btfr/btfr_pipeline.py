@@ -1,399 +1,464 @@
 ##### mpiexec -n 4 python btfr/btfr_contra.py
 
-import sys
-sys.path.append('/Users/fedorboreiko/Documents/Oxford/btfr_z')
+"""
+Single-model SPARC BTFR prediction and plotting pipeline.
 
-from mpi4py import MPI
-import numpy as np
-from numpy.lib import recfunctions as rfn
-import pandas as pd
-from utils import *
-from BAM import AbundanceMatch, proxies
-from btfr.code_legacy.btfr_utils import get_x_cutoff_fit, nfw_circular_velocity_contra, nfw_circular_velocity_contra_vect, nfw_circular_velocity, nfw_circular_velocity_vect, get_loglike
-from matplotlib import rcParams
-import matplotlib.pyplot as plt
-from tqdm import tqdm
-import pickle
-import time
+This driver mirrors the modular JAX likelihood-grid scripts but evaluates a
+single (alpha, scatter, x, nu) model point and retains the diagnostics needed
+for the BTFR and optional per-galaxy plots.
+
+Run with:
+    mpiexec -n 4 python btfr_pipeline.py
+"""
+
+import gc
+import traceback
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Optional
+
 import jax
 import jax.numpy as jnp
-from jax.scipy.ndimage import map_coordinates
-from functools import partial
+from jax import random
+import numpy as np
+from numpy.lib import recfunctions as rfn
+from mpi4py import MPI
+from matplotlib import rcParams
 
-jax.config.update("jax_enable_x64", True)
+from BAM import AbundanceMatch, proxies
+from utils import *
+from likelihood_computation_grid_jax import (
+    compute_simulated_diagnostics,
+    evaluate_likelihoods,
+)
 
-rcParams['font.family'] = 'serif'
-rcParams['font.serif'] = ['Computer Modern']
-rcParams['text.usetex'] = True
 
-N_AM_REALS = 100
-N_STELLAR_REALS = 1000
+@dataclass
+class SingleModelConfig:
+    """Configuration for one BTFR model prediction."""
 
-ALPHAPROXY = 0.5
-SCATTER = 0.1
-X = 0.0
-NU = np.linspace(-3.0, 3.0, 20)[11]
-ALPHA = np.tan(ALPHAPROXY)
-VMAX_SHIFT_MODE = False
+    n_am_reals: int = 100
+    n_stellar_reals: int = 1000
 
-M2L_DISK_MEAN = 0.5
-M2L_DISK_ERROR = 0.2
+    alpha_proxy: float = 0.5
+    scatter: float = 0.1
+    x: float = 0.0
+    nu: float = float(np.linspace(-3.0, 3.0, 20)[11])
 
-M2L_BULGE_MEAN = 0.7
-M2L_BULGE_ERROR = 0.2
+    base_seed: int = 42
+    vmax_shift_mode: bool = False
 
-# Initialize MPI
-comm = MPI.COMM_WORLD
-rank = comm.Get_rank()
-size = comm.Get_size()
+    plot_individual_histograms: bool = False
+    save_samples: bool = False
+    use_tex: bool = True
+    output_dir: str = "."
+    plot_filename: Optional[str] = None
 
-if rank == 0:
-    print('Number of processes:', size)
-    print(f'Model parameters: alpha = {ALPHA}, scatter = {SCATTER}, x = {X}, nu = {NU}')
+    def __post_init__(self):
+        if self.n_am_reals <= 0 or self.n_stellar_reals <= 0:
+            raise ValueError("Numbers of realizations must be positive")
+        if self.scatter < 0:
+            raise ValueError("scatter must be non-negative")
+        if not 0.0 <= self.x < 1.0:
+            raise ValueError("x must satisfy 0 <= x < 1")
 
-@partial(jax.jit, static_argnames=("order",))
-def jax_contra_interpolator(grid, positions, grid_axes, order=1):
-    """
-    A thin wrapper that converts the contra grid and query points into JAX arrays,
-    performs interpolation, and applies a validity mask to handle out-of-bounds points
-    by setting the log(mhi) value to nans.
-    """
-    indices = []
-    valid_mask = jnp.ones(positions.shape[0], dtype=bool)
-    for i in range(positions.shape[1]):
-        axis = grid_axes[i]
-        grid_min = axis[0]
-        grid_max = axis[-1]
-        n_points = axis.shape[0]
-        index_coord = (positions[:, i] - grid_min) / (grid_max - grid_min) * (n_points - 1)
-        valid_mask &= (positions[:, i] >= grid_min) & (positions[:, i] <= grid_max)
-        indices.append(index_coord)
+    @property
+    def alpha(self) -> float:
+        return float(np.tan(self.alpha_proxy))
 
-    coords = jnp.stack(indices, axis=0)  # shape: (dimensions, n_points)
-    interpolated_values = map_coordinates(grid, coords, order=order, mode='constant', cval=0)
-    return jnp.where(valid_mask, interpolated_values, jnp.nan)
 
-def compute_AM_realization(abundance_match, deconv, sparc_galaxy_list, mass_models, halos, 
-                           L_bulges, L_36_means, L_36_errors, Eff_rads, MH1_means, MH1_errors, 
-                           dists, dists_err, emulator):
-    
-    # Add scatter to the deconvoluted catalog, and return the catalog of stellar masses matched to halos from the halo catalog
-    mask, catalog_sc = abundance_match.add_scatter(deconv, cut_range=(3, 12), return_catalog=True)
+class SingleModelBtfrPipeline:
+    """Generate and plot the prediction for one BTFR model point."""
 
-    # Sort the catalog and extract the sorted indices
-    sorted_indices = np.argsort(catalog_sc)
-    catalog_sc_sorted = catalog_sc[sorted_indices]
+    def __init__(self, config: SingleModelConfig):
+        self.config = config
+        self.comm = MPI.COMM_WORLD
+        self.rank = self.comm.Get_rank()
+        self.size = self.comm.Get_size()
+        self.master_key = random.PRNGKey(config.base_seed)
 
-    # Generate N_STELLAR_REALS of mock stellar masses
-    dist_samples = np.random.normal(loc=dists[:, np.newaxis], scale=dists_err[:, np.newaxis], size=(len(galaxy_sample), N_STELLAR_REALS)) # Mpc
-    L_36_samples = np.random.normal(loc=L_36_means[:, np.newaxis], scale=L_36_errors[:, np.newaxis], size=(len(sparc_galaxy_list), N_STELLAR_REALS)) # 1e9 L_sun
+        self.contra_grids, self.grid_axes = load_emulators()
 
-    log_M2L_disk_samples = np.random.normal(loc=np.log10(M2L_DISK_MEAN), scale=M2L_DISK_ERROR, size=(len(sparc_galaxy_list), N_STELLAR_REALS)) 
-    log_M2L_bulge_samples = np.random.normal(loc=np.log10(M2L_BULGE_MEAN), scale=M2L_BULGE_ERROR, size=(len(sparc_galaxy_list), N_STELLAR_REALS)) 
+    def _select_halos(self, halo_catalog: np.ndarray) -> np.ndarray:
+        """Apply the same x-dependent halo selection as the grid scripts."""
+        slope, intercept = get_x_cutoff_fit(halo_catalog, self.config.x)
+        halos_selected = rfn.append_fields(
+            halo_catalog.copy(),
+            "select",
+            np.ones(halo_catalog.shape[0], dtype=float),
+            usemask=False,
+        )
 
-    M2L_disk_samples = 10**log_M2L_disk_samples # M_sun / L_sun
-    M2L_bulge_samples = 10**log_M2L_bulge_samples # M_sun / L_sun
+        halo_log_mvir = np.log10(halos_selected["Mvir"])
+        halo_log_vmax = np.log10(halos_selected["vmax"])
+        cutoff = slope * halo_log_mvir + intercept
+        halos_selected["select"][halo_log_vmax > cutoff] = np.nan
+        return halos_selected
 
-    MH1_samples = np.random.normal(loc=MH1_means[:, np.newaxis], scale=MH1_errors[:, np.newaxis], size=(len(sparc_galaxy_list), N_STELLAR_REALS)) * 1e9 # M_sun
+    def _setup_contra_interpolator(self):
+        """Construct the same JAX contra interpolator used by the grids."""
+        nu = self.config.nu
+        if nu == 0.0:
+            return None
+        if nu not in self.contra_grids:
+            raise ValueError(
+                f"Contra grid for nu={nu} not found. "
+                f"Available grids: {list(self.contra_grids.keys())}"
+            )
 
-    M_star_samples = np.abs((L_36_samples - L_bulges[:, np.newaxis]) * M2L_disk_samples + L_bulges[:, np.newaxis] * M2L_bulge_samples) * (dists[:, np.newaxis] / dist_samples)**2 * 1e9 * 0.7 # M_sun / h
-    log_M_star_samples = np.log10(M_star_samples)
+        grid_jax = jnp.asarray(self.contra_grids[nu], dtype=jnp.float32)
+        grid_axes = self.grid_axes
 
-    # Match the stellar masses to halos
-    indices_sorted = np.searchsorted(catalog_sc_sorted, log_M_star_samples.flatten())
-    indices_sorted = np.clip(indices_sorted, 0, len(catalog_sc_sorted) - 1)
-    indices = sorted_indices[indices_sorted].reshape(len(sparc_galaxy_list), N_STELLAR_REALS)
+        def contra_interpolator(points):
+            return jax_contra_interpolator(grid_jax, points, grid_axes)
 
-    matched_halos = halos[indices]
+        return contra_interpolator
 
-    # Simulate the rotation curves
-    vels = np.empty((len(sparc_galaxy_list), N_STELLAR_REALS))
-    masses = np.empty((len(sparc_galaxy_list), N_STELLAR_REALS))
-    dm_vels = np.empty((len(sparc_galaxy_list), N_STELLAR_REALS)) # these three are not strictly necessary, but are kept for visualisation purposes
-    bar_vels = np.empty((len(sparc_galaxy_list), N_STELLAR_REALS))
+    @staticmethod
+    def _extract_galaxy_data(
+            sparc_galaxy_names, galaxy_properties: Dict,
+            bulge_luminosities: Dict) -> Dict[str, np.ndarray]:
+        """Extract intrinsic galaxy properties for the shared forward model."""
+        galaxy_data = {
+            "L36": np.asarray([
+                galaxy_properties[name]["Total Luminosity at [3.6]"]
+                for name in sparc_galaxy_names
+            ]),
+            "L36_err": np.asarray([
+                galaxy_properties[name]["Luminosity Error"]
+                for name in sparc_galaxy_names
+            ]),
+            "Reff": np.asarray([
+                galaxy_properties[name]["Effective Radius at [3.6]"]
+                for name in sparc_galaxy_names
+            ]),
+            "MH1": np.asarray([
+                galaxy_properties[name]["Total HI mass"]
+                for name in sparc_galaxy_names
+            ]),
+            "d": np.asarray([
+                galaxy_properties[name]["Distance"]
+                for name in sparc_galaxy_names
+            ]),
+            "d_err": np.asarray([
+                galaxy_properties[name]["Distance Error"]
+                for name in sparc_galaxy_names
+            ]),
+            "Lbulge": np.asarray([
+                bulge_luminosities[name] for name in sparc_galaxy_names
+            ]),
+        }
+        galaxy_data["MH1_err"] = 0.1 * galaxy_data["MH1"]
+        return galaxy_data
 
-    for j, galaxy in enumerate(sparc_galaxy_list):
-        
-        # Extract the galaxy's data from vectorized mass models
-        selected_rows = mass_models[mass_models['ID'] == galaxy]
-        rads = np.asarray(selected_rows['R'])  # kpc
-        V_gas = np.asarray(selected_rows['Vgas'])
-        V_disk = np.asarray(selected_rows['Vdisk'])
-        V_bul = np.asarray(selected_rows['Vbul'])
+    @staticmethod
+    def _preprocess_data_for_jax(galaxy_data, mass_model_data, halo_catalog):
+        galaxy_data_jax = {
+            key: jnp.asarray(value, dtype=jnp.float32)
+            for key, value in galaxy_data.items()
+        }
+        mass_model_data_jax = {
+            key: jnp.asarray(value, dtype=jnp.float32)
+            for key, value in mass_model_data.items()
+        }
+        halo_catalog_data = {
+            field: jnp.asarray(halo_catalog[field])
+            for field in halo_catalog.dtype.names
+        }
+        return galaxy_data_jax, mass_model_data_jax, halo_catalog_data
 
-        M_baryon = M_star_samples[j] / 0.7 + 1.33 * MH1_samples[j]
+    def _print_computation_info(self):
+        if self.rank != 0:
+            return
+        print(f"Number of processes: {self.size}")
+        print(f"Number of AM realizations: {self.config.n_am_reals}")
+        print(f"Number of stellar realizations: {self.config.n_stellar_reals}")
+        print(
+            "Model parameters: "
+            f"alpha_proxy={self.config.alpha_proxy:.6g}, "
+            f"alpha={self.config.alpha:.6g}, "
+            f"scatter={self.config.scatter:.6g}, "
+            f"x={self.config.x:.6g}, nu={self.config.nu:.6g}"
+        )
+        print(
+            f"Vmax shift mode: "
+            f"{'ON' if self.config.vmax_shift_mode else 'OFF'}"
+        )
 
-        Mvir = matched_halos[j]['Mvir'] / 0.7
-        Rvir = matched_halos[j]['Rvir'] / 0.7
-        rs = matched_halos[j]['rs'] / 0.7
+    def _velocity_shift(self, local_log_vmax, log_vobs) -> float:
+        """Reproduce the legacy global mean-log-velocity shift using MPI."""
+        if not self.config.vmax_shift_mode:
+            return 0.0
 
-        if NU == 0.0:
-            # the case of no halo contraction/expansion, use basic NFW profile
-            V_dm = nfw_circular_velocity(rads, Mvir, Rvir, rs)
-        
+        local_sum = float(np.nansum(local_log_vmax))
+        local_count = int(np.count_nonzero(np.isfinite(local_log_vmax)))
+        global_sum = self.comm.allreduce(local_sum, op=MPI.SUM)
+        global_count = self.comm.allreduce(local_count, op=MPI.SUM)
+        if global_count == 0:
+            raise RuntimeError("No finite simulated velocities are available")
+
+        mean_model = global_sum / global_count
+        mean_observed = float(np.mean(log_vobs))
+        return mean_observed - mean_model
+
+    def _gather_predictions(self, local_predictions):
+        """Gather variable-sized local sample blocks safely onto rank 0."""
+        gathered = self.comm.gather(local_predictions, root=0)
+        if self.rank != 0:
+            return None
+
+        return {
+            name: np.concatenate([block[name] for block in gathered], axis=1)
+            for name in local_predictions
+        }
+
+    @staticmethod
+    def _summary_statistics(global_predictions, velocity_shift):
+        with np.errstate(divide="ignore", invalid="ignore"):
+            log_vmax = np.log10(global_predictions["Vmax"]) + velocity_shift
+            log_mbar = np.log10(global_predictions["Mbar"])
+            log_vdm = np.log10(global_predictions["Vdm_max"])
+            log_vbar = np.log10(global_predictions["Vbar_max"])
+
+        return {
+            "log_vmax_samples": log_vmax,
+            "log_mbar_samples": log_mbar,
+            "log_vdm_samples": log_vdm,
+            "log_vbar_samples": log_vbar,
+            "log_vmax_mean": np.nanmean(log_vmax, axis=1),
+            "log_vmax_std": np.nanstd(log_vmax, axis=1),
+            "log_mbar_mean": np.nanmean(log_mbar, axis=1),
+            "log_mbar_std": np.nanstd(log_mbar, axis=1),
+        }
+
+    def _model_tag(self) -> str:
+        return (
+            f"alpha_{self.config.alpha:.3f}_"
+            f"scatter_{self.config.scatter:.3f}_"
+            f"x_{self.config.x:.3f}_nu_{self.config.nu:.3f}"
+        )
+
+    def _plot_results(
+            self, sparc_galaxy_names, summary, observed, log_likelihood):
+        output_dir = Path(self.config.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        rcParams["font.family"] = "serif"
+        rcParams["font.serif"] = ["Computer Modern"]
+        rcParams["text.usetex"] = self.config.use_tex
+
+        if self.config.plot_filename is None:
+            plot_path = output_dir / f"btfr_corrected_{self._model_tag()}.png"
         else:
-            # the case of halo contraction/expansion, use contra emulator
-            V_dm = nfw_circular_velocity_contra(rads, Eff_rads[j], Rvir, rs, Mvir, M_baryon, emulator)
+            plot_path = output_dir / self.config.plot_filename
 
-        # Calculate the maximum circular velocity of the galaxy's total rotation curve
-        V_max = np.sqrt(np.nanmax(
-                                    V_gas * np.abs(V_gas) +
-                                    M2L_disk_samples[j][:, np.newaxis] * V_disk * np.abs(V_disk) +
-                                    M2L_bulge_samples[j][:, np.newaxis] * V_bul * np.abs(V_bul) +
-                                    V_dm * np.abs(V_dm),
-                                    axis=1
-                                )) # km/s
+        if self.config.plot_individual_histograms:
+            hist_dir = output_dir / f"RTstats_{self._model_tag()}"
+            hist_dir.mkdir(parents=True, exist_ok=True)
+            for galaxy_index, galaxy_name in enumerate(sparc_galaxy_names):
+                vels_hist(
+                    summary["log_vmax_samples"][galaxy_index],
+                    summary["log_vdm_samples"][galaxy_index],
+                    summary["log_vbar_samples"][galaxy_index],
+                    summary["log_vmax_mean"][galaxy_index],
+                    summary["log_vmax_std"][galaxy_index],
+                    observed["log_vobs"][galaxy_index],
+                    observed["log_vobs_err"][galaxy_index],
+                    summary["log_mbar_mean"][galaxy_index],
+                    10,
+                    10,
+                    str(hist_dir / f"RTstats_{galaxy_index:03d}_{galaxy_name}.png"),
+                )
 
-        vels[j, :] = V_max
-        masses[j, :] = M_baryon
+        btfr_plot(
+            alpha=self.config.alpha,
+            sigma=self.config.scatter,
+            x=self.config.x,
+            nu=self.config.nu,
+            vmaxshift=self.config.vmax_shift_mode,
+            loglike=log_likelihood,
+            xsim=summary["log_vmax_mean"],
+            ysim=summary["log_mbar_mean"],
+            xsimerr=summary["log_vmax_std"],
+            ysimerr=summary["log_mbar_std"],
+            xobs=observed["log_vobs"],
+            yobs=observed["log_mobs"],
+            xobserr=observed["log_vobs_err"],
+            yobserr=observed["log_mobs_err"],
+            plotname=str(plot_path),
+            ax=None,
+        )
+        return plot_path
 
-        # To visualise baryonic and dark matter contributions to the rotation curve:
-        V_bar_max = np.sqrt(np.max(
-                                    V_gas * np.abs(V_gas) +
-                                    M2L_disk_samples[j][:, np.newaxis] * V_disk * np.abs(V_disk) +
-                                    M2L_bulge_samples[j][:, np.newaxis] * V_bul * np.abs(V_bul),
-                                    axis=1
-                                )) # km/s
-        
-        dm_vels[j, :] = np.max(V_dm, axis=1)
-        bar_vels[j, :] = V_bar_max
-    
-    selection_mask = matched_halos['select']
-    vels *= selection_mask
-    masses *= selection_mask
-    dm_vels *= selection_mask
-    bar_vels *= selection_mask
+    def _save_samples(self, global_predictions, velocity_shift):
+        if not self.config.save_samples:
+            return None
+        output_path = Path(self.config.output_dir) / f"samples_{self._model_tag()}.npz"
+        np.savez_compressed(
+            output_path,
+            velocity_shift=velocity_shift,
+            **global_predictions,
+        )
+        return output_path
 
-    return vels, masses, dm_vels, bar_vels
+    def run(self):
+        """Run the single-model forward calculation and make the BTFR plot."""
+        try:
+            (
+                sparc_galaxy_names,
+                bulge_luminosities,
+                galaxy_properties,
+                mass_model_data,
+                sparc_btfr_data,
+                stellar_mass_bins,
+                stellar_mass_function,
+                halo_catalog,
+            ) = load_data()
 
-if rank == 0:
+            mass_model_data = vectorize_mass_model_table(
+                sparc_galaxy_names, mass_model_data
+            )
+            galaxy_data = self._extract_galaxy_data(
+                sparc_galaxy_names, galaxy_properties, bulge_luminosities
+            )
 
-    # Pre-load data
-    bulge_lumins = pd.read_csv('Tabular_data/Bulge_lum_table.csv')
-    mass_models = pd.read_csv('Tabular_data/Mass_models_table.csv')
-    galaxy_sample = pd.read_csv('Tabular_data/Gal_sample_table.csv')
-    sparc_btfr = pd.read_csv('Tabular_data/sparc_btfr.csv')
+            vobs = np.asarray(sparc_btfr_data["Vmax"], dtype=np.float64).reshape(-1)
+            vobs_err = np.asarray(
+                sparc_btfr_data["e_Vmax"], dtype=np.float64
+            ).reshape(-1)
+            observed = {
+                "log_vobs": np.log10(vobs),
+                "log_vobs_err": vobs_err / (vobs * np.log(10.0)),
+                "log_mobs": np.asarray(
+                    sparc_btfr_data["log(Mb)"], dtype=np.float64
+                ).reshape(-1),
+                "log_mobs_err": np.asarray(
+                    sparc_btfr_data["e_log(Mb)"], dtype=np.float64
+                ).reshape(-1),
+            }
 
-    sparc_galaxy_list = sparc_btfr['Name']
+            halos_selected = self._select_halos(halo_catalog)
+            galaxy_data_jax, mass_model_data_jax, halo_catalog_data = (
+                self._preprocess_data_for_jax(
+                    galaxy_data, mass_model_data, halos_selected
+                )
+            )
 
-    bulge_lumins = bulge_lumins[bulge_lumins['Galaxy'].isin(sparc_galaxy_list)]
-    mass_models = mass_models[mass_models['ID'].isin(sparc_galaxy_list)]
-    galaxy_sample = galaxy_sample[galaxy_sample['Galaxy'].isin(sparc_galaxy_list)]
-    sparc_btfr = sparc_btfr[sparc_btfr['Name'].isin(sparc_galaxy_list)]
+            proxy = proxies["mvir_proxy"](use_cache=False)
+            abundance_match = AbundanceMatch(
+                stellar_mass_bins[10:],
+                stellar_mass_function[10:],
+                halo_proxy=proxy,
+                ext_range=(3.0, 12.0),
+                boxsize=140,
+                faint_end_first=True,
+                scatter_mult=1,
+                faint_end_slope=-0.42,
+            )
+            contra_interpolator = self._setup_contra_interpolator()
 
-    bulge_lumins_dict = bulge_lumins.set_index('Galaxy')['Lbul'].to_dict()
-    galaxy_data_dict = galaxy_sample.set_index('Galaxy').to_dict('index')
+            self._print_computation_info()
+            self.master_key, model_key = random.split(self.master_key)
+            local_predictions = compute_simulated_diagnostics(
+                model_key,
+                self.config.alpha,
+                self.config.scatter,
+                self.config.nu,
+                abundance_match,
+                contra_interpolator,
+                galaxy_data_jax,
+                mass_model_data_jax,
+                halos_selected,
+                halo_catalog_data,
+                self.config.n_am_reals,
+                self.config.n_stellar_reals,
+                self.size,
+                self.rank,
+            )
 
-    L_36_means = np.array([galaxy_data_dict[galaxy]['Total Luminosity at [3.6]'] for galaxy in sparc_galaxy_list]) # 1e9 L_sun
-    L_36_errors = np.array([galaxy_data_dict[galaxy]['Luminosity Error'] for galaxy in sparc_galaxy_list]) # 1e9 L_sun
-    Eff_radii = np.array([galaxy_data_dict[galaxy]['Effective Radius at [3.6]'] for galaxy in sparc_galaxy_list]) # kpc
-    MH1_means = np.array([galaxy_data_dict[galaxy]['Total HI mass'] for galaxy in sparc_galaxy_list]) # 1e9 M_sun
-    MH1_errors = MH1_means * 0.1 # 1e9 M_sun
-    dists = np.array([galaxy_data_dict[galaxy]['Distance'] for galaxy in sparc_galaxy_list]) # Mpc
-    dists_err = np.array([galaxy_data_dict[galaxy]['Distance Error'] for galaxy in sparc_galaxy_list]) # Mpc
-    L_bulges = np.array([bulge_lumins_dict[galaxy] for galaxy in sparc_galaxy_list]) # 1e9 L_sun
+            with np.errstate(divide="ignore", invalid="ignore"):
+                local_log_vmax = np.log10(local_predictions["Vmax"])
+            velocity_shift = self._velocity_shift(
+                local_log_vmax, observed["log_vobs"]
+            )
+            local_log_vmax = local_log_vmax + velocity_shift
 
-    # Load GSMF data and halo catalog
-    log_stellar_masses, SMF_data, _ = get_GSMF_ELPETRO(plotting=False)
-    halos = np.load("/Users/fedorboreiko/Documents/Oxford/Personal_codes/Codebase/halos_z_0p00.npy")
+            log_likelihood = float(evaluate_likelihoods(
+                local_log_vmax,
+                observed["log_vobs"],
+                observed["log_vobs_err"],
+                self.comm,
+            )[0])
 
-    # Implement halo selection on the halo catalog
-    slope, intercept = get_x_cutoff_fit(halos, X)
-    halos_selected = halos.copy()
-    halos_selected = rfn.append_fields(halos_selected, 'select', np.ones(halos.shape[0], dtype=float), usemask=False)
-    halo_log_Mvir = np.log10(halos_selected['Mvir'])
-    halo_log_vmax = np.log10(halos_selected['vmax'])
-    predicted_log_vmax = slope * halo_log_Mvir + intercept
-    halos_selected['select'][halo_log_vmax > predicted_log_vmax] = np.nan
+            global_predictions = self._gather_predictions(local_predictions)
+            if self.rank != 0:
+                return None
 
-    # Create abundance matching (AM) object
-    proxy = proxies["mvir_proxy"](use_cache=False)
-    abundance_match = AbundanceMatch(log_stellar_masses[10:], SMF_data[10:], halo_proxy=proxy, ext_range=(3.0, 12.0),
-                                     boxsize=140, faint_end_first=True, scatter_mult=1, faint_end_slope=-0.42)
+            summary = self._summary_statistics(
+                global_predictions, velocity_shift
+            )
+            total_samples = self.config.n_am_reals * self.config.n_stellar_reals
+            retained_percent = 100.0 * np.count_nonzero(
+                np.isfinite(summary["log_vmax_samples"]), axis=1
+            ) / total_samples
 
-    theta = {"alpha": ALPHA, "scatter": SCATTER}  # AM model parameters
-    # Deconvolute the AM catalog
-    deconv = abundance_match.deconvoluted_catalogs(theta, halos_selected)
+            print("\nSingle-model abundance-matching pipeline finished")
+            print(f"Log likelihood: {log_likelihood:.8f}")
+            if self.config.vmax_shift_mode:
+                print(f"Applied log10(Vmax) shift: {velocity_shift:.8f}")
+            print(
+                "Percentage of samples retained after halo/emulator selection "
+                "(per galaxy):"
+            )
+            print(np.round(retained_percent, 2).tolist())
 
-    # Instead of loading a pre-trained interpolator, load grids and then build the jax-based callable.
-    try:
-        with open("/Users/fedorboreiko/Documents/Oxford/Personal_codes/Codebase/contra_emulators/grids_fullrange.pkl", "rb") as f:
-            contra_grids = pickle.load(f)
-    except FileNotFoundError:
-        print("Error: Contra emulator grids were not found. Please run the grid-generation script first.")
-        sys.exit(1)
+            plot_path = self._plot_results(
+                sparc_galaxy_names, summary, observed, log_likelihood
+            )
+            samples_path = self._save_samples(
+                global_predictions, velocity_shift
+            )
+            print(f"BTFR plot saved to: {plot_path}")
+            if samples_path is not None:
+                print(f"Samples saved to: {samples_path}")
 
-    # Define grid axes matching the interpolation grid-generation stage.
-    N_SAMPLES = 50  # must match the grid generation
-    log_c_grid  = np.linspace(0, 3.9, N_SAMPLES)
-    log_fb_grid = np.linspace(-3.6, -0.03, N_SAMPLES)
-    log_rb_grid = np.linspace(-3, -1, N_SAMPLES)
-    log_rf_grid = np.linspace(-4.8, 0.3, N_SAMPLES)
-    grid_axes = [log_c_grid, log_fb_grid, log_rb_grid, log_rf_grid]
+            gc.collect()
+            jax.clear_caches()
+            return {
+                "log_likelihood": log_likelihood,
+                "velocity_shift": velocity_shift,
+                "retained_percent": retained_percent,
+                "plot_path": plot_path,
+                "samples_path": samples_path,
+                "summary": summary,
+            }
 
-    if NU != 0.0:
-        if NU in contra_grids:
-            # Create a contra_interpolator that uses the JAX-based interpolation.
-            contra_grid = contra_grids[NU]
-            grid_jax = jnp.array(contra_grid, dtype=jnp.float64)
-            def contra_interpolator(points):
-                return jax_contra_interpolator(grid_jax, points, grid_axes)
-        else:
-            print(f"Contra emulator for nu={NU} is not available. Please verify that the grid-generation script includes nu={NU}.")
-            sys.exit(1)
-    else:
-        contra_interpolator = None
+        except Exception as exc:
+            if self.rank == 0:
+                print(f"Fatal error in single-model BTFR pipeline: {exc}")
+                traceback.print_exc()
+            raise
 
-else:
 
-    sparc_galaxy_list = None
-    mass_models = None
-    L_36_means = None
-    L_36_errors = None
-    Eff_radii = None
-    MH1_means = None
-    MH1_errors = None
-    dists = None
-    dists_err = None
-    L_bulges = None
-    abundance_match = None
-    deconv = None
-    halos_selected = None
-    contra_interpolator = None
+def main():
+    config = SingleModelConfig(
+        n_am_reals=100,
+        n_stellar_reals=1000,
+        alpha_proxy=0.0,
+        scatter=0.19,
+        x=0.84,
+        nu=0.430, #float(np.linspace(-3.0, 3.0, 20)[10]),
+        base_seed=42,
+        vmax_shift_mode=False,
+        plot_individual_histograms=False,
+        save_samples=False,
+        use_tex=True,
+        output_dir="/Users/fedorboreiko/Documents/Oxford/btfr_z/plots",
+    )
 
-# Broadcast data to all processes
-sparc_galaxy_list = comm.bcast(sparc_galaxy_list, root=0)
-mass_models = comm.bcast(mass_models, root=0)
-L_36_means = comm.bcast(L_36_means, root=0)
-L_36_errors = comm.bcast(L_36_errors, root=0)
-Eff_radii = comm.bcast(Eff_radii, root=0)
-MH1_means = comm.bcast(MH1_means, root=0)
-MH1_errors = comm.bcast(MH1_errors, root=0)
-dists = comm.bcast(dists, root=0)
-dists_err = comm.bcast(dists_err, root=0)
-L_bulges = comm.bcast(L_bulges, root=0)
-abundance_match = comm.bcast(abundance_match, root=0)
-deconv = comm.bcast(deconv, root=0)
-halos = comm.bcast(halos, root=0)
-halos_selected = comm.bcast(halos_selected, root=0)
-contra_interpolator = comm.bcast(contra_interpolator, root=0)
+    pipeline = SingleModelBtfrPipeline(config)
+    pipeline.run()
 
-# Split the realizations across processes
-realizations_per_process = np.array_split(np.arange(N_AM_REALS), size)
-local_realizations = realizations_per_process[rank]
 
-# Compute local results
-local_vels = np.empty((len(local_realizations), len(sparc_galaxy_list), N_STELLAR_REALS))
-local_masses = np.empty((len(local_realizations), len(sparc_galaxy_list), N_STELLAR_REALS))
-local_dm_vels = np.empty((len(local_realizations), len(sparc_galaxy_list), N_STELLAR_REALS))
-local_bar_vels = np.empty((len(local_realizations), len(sparc_galaxy_list), N_STELLAR_REALS))
-
-if rank == 0:
-    pbar = tqdm(total=len(local_realizations), desc="Progress", position=0, leave=True)
-
-for i, realization in enumerate(local_realizations):
-
-    vels, masses, dm_vels, bar_vels = compute_AM_realization(abundance_match, deconv, sparc_galaxy_list, mass_models, halos_selected, 
-                                                             L_bulges, L_36_means, L_36_errors, Eff_radii, MH1_means, MH1_errors, 
-                                                             dists, dists_err, contra_interpolator)
-    local_vels[i, :, :] = vels
-    local_masses[i, :, :] = masses
-    local_dm_vels[i, :, :] = dm_vels
-    local_bar_vels[i, :, :] = bar_vels
-
-    if rank == 0:
-        pbar.update(1)
-
-if rank == 0:
-    pbar.close()
-
-# Gather results from all processes
-global_vels = None
-global_masses = None
-global_dm_vels = None
-global_bar_vels = None
-
-if rank == 0:
-
-    global_vels = np.empty((N_AM_REALS, len(sparc_galaxy_list), N_STELLAR_REALS))
-    global_masses = np.empty((N_AM_REALS, len(sparc_galaxy_list), N_STELLAR_REALS))
-    global_dm_vels = np.empty((N_AM_REALS, len(sparc_galaxy_list), N_STELLAR_REALS))
-    global_bar_vels = np.empty((N_AM_REALS, len(sparc_galaxy_list), N_STELLAR_REALS))
-
-comm.Gather(local_vels, global_vels, root=0)
-comm.Gather(local_masses, global_masses, root=0)
-comm.Gather(local_dm_vels, global_dm_vels, root=0)
-comm.Gather(local_bar_vels, global_bar_vels, root=0)
-
-# Calculate log likelihood
-if rank == 0:
-
-    print('\nAbundance Matching Pipeline finished!')
-    print('Calculating log likelihood...')
-
-    global_vels_reshaped = np.transpose(global_vels, (1, 0, 2))
-    global_masses_reshaped = np.transpose(global_masses, (1, 0, 2))
-    global_dm_vels_reshaped = np.transpose(global_dm_vels, (1, 0, 2))
-    global_bar_vels_reshaped = np.transpose(global_bar_vels, (1, 0, 2))
-
-    V_mocks = np.log10(global_vels_reshaped.reshape(len(galaxy_sample), -1))
-
-    V_dm_mocks = np.log10(global_dm_vels_reshaped.reshape(len(galaxy_sample), -1))
-    V_bar_mocks = np.log10(global_bar_vels_reshaped.reshape(len(galaxy_sample), -1))
-
-    # Print the percentages
-    original_length = N_AM_REALS * N_STELLAR_REALS
-    filtered_lengths = [np.count_nonzero(~np.isnan(row)) for row in V_mocks]
-    print("Percentage of original array length retained after filtering out-of-bound points (per galaxy):")
-    print([round((length / original_length) * 100, 2) for length in filtered_lengths])
-
-    V_mock = np.array([np.nanmean(row) for row in V_mocks])
-    V_mock_err = np.array([np.nanstd(row) for row in V_mocks])
-
-    # Observed data
-    V_obs_unlogged = np.array(sparc_btfr['Vmax'])
-    V_obs_err_unlogged = np.array(sparc_btfr['e_Vmax'])
-
-    V_obs = np.log10(V_obs_unlogged)
-    V_obs_err = V_obs_err_unlogged / (V_obs_unlogged * np.log(10))
-
-    # Mean velocity shift mode
-    if VMAX_SHIFT_MODE:
-        mean_V_obs = np.mean(V_obs)
-        mean_V_mocks = np.nanmean(V_mocks)
-        shift = mean_V_obs - mean_V_mocks
-        V_mocks_mode = V_mocks + shift
-        V_mock_mode = V_mock + shift
-    else:
-        V_mocks_mode = V_mocks
-        V_mock_mode = V_mock
-
-    log_likelihood, _ = get_loglike(V_mocks_mode, V_obs, V_obs_err)
-
-    print(f'Log likelihood: {log_likelihood}')
-
-    # Plot the BTFR
-    M_mocks = np.log10(global_masses_reshaped.reshape(len(galaxy_sample), -1))
-
-    M_mock = np.array([np.nanmean(row) for row in M_mocks])
-    M_mock_err = np.array([np.nanstd(row) for row in M_mocks])
-
-    M_obs = np.array(sparc_btfr['log(Mb)'])
-    M_obs_err = np.array(sparc_btfr['e_log(Mb)'])
-
-    # Plot individual galaxy rotation curve statistics
-    indiv_hists = False
-    if indiv_hists:
-        for galnum in range(len(sparc_galaxy_list)):
-
-            vels_hist(V_mocks_mode[galnum], V_dm_mocks[galnum], V_bar_mocks[galnum],
-                        V_mock_mode[galnum], V_mock_err[galnum],
-                        V_obs[galnum], V_obs_err[galnum],
-                        M_mock[galnum], 10, 10, 
-                        f'/Users/fedorboreiko/Documents/Oxford/btfr_z/plots/RTstats_alpha_{ALPHA}_scatter_{SCATTER}_x{X}_nu_{NU}/RTstats_galaxy_{galnum}_alpha_{ALPHA}_scatter_{SCATTER}_nu_{NU:.3f}.png')
-
-    btfr_plot(alpha=ALPHA, sigma=SCATTER, x=X, nu=NU, vmaxshift=False, loglike=log_likelihood, 
-              xsim=V_mock_mode, ysim=M_mock, xsimerr=V_mock_err, ysimerr=M_mock_err, 
-              xobs=V_obs, yobs=M_obs, xobserr=V_obs_err, yobserr=M_obs_err, 
-              plotname=f'/Users/fedorboreiko/Documents/Oxford/btfr_z/plots/btfr_alpha_{ALPHA:.3f}_scatter_{SCATTER}_x_{X}_nu_{NU:.3f}.png',
-              ax=None)
+if __name__ == "__main__":
+    main()

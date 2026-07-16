@@ -1,6 +1,6 @@
 import numpy as np
 import numpy.lib.recfunctions as rfn  # Used to append a field to the structured array
-from utils import *
+from btfr.code_legacy.utils_legacy import *
 import matplotlib.pyplot as plt
 from matplotlib import rcParams
 

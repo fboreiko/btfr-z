@@ -2,7 +2,7 @@ from mpi4py import MPI
 import numpy as np
 from numpy.lib import recfunctions as rfn
 import pandas as pd
-from utils import *
+from btfr.code_legacy.utils_legacy import *
 from BAM import AbundanceMatch, proxies
 from memory_profiler import profile
 from tqdm import tqdm

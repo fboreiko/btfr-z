@@ -4,129 +4,146 @@ from jax import random, jit
 from functools import partial
 import numpy as np
 from mpi4py import MPI
-
-# Enable 32-bit precision for better performance and memory usage
+ 
 jax.config.update("jax_enable_x64", True)
-
+ 
 # Constants
 G = 4.30091e-6  # Gravitational constant in kpc * (km/s)^2 / M_sun
-
-
+ 
+ 
 def mpi_weighted_average(log_avg_likelihoods_local, non_nan_counts_local, comm):
     """
     Compute global weighted average using MPI.Allreduce.
-    
+ 
     Args:
         log_avg_likelihoods_local (np.ndarray): Local averaged log-likelihoods, shape (n_galaxies,)
         non_nan_counts_local (np.ndarray): Local non-NaN counts, shape (n_galaxies,)
         comm (MPI.Comm): MPI communicator
-        
+ 
     Returns:
         np.ndarray: Global weighted averaged log-likelihoods, shape (n_galaxies,)
     """
-
+ 
     avg_likelihoods_local = np.exp(log_avg_likelihoods_local)
-
+ 
     weighted_local = avg_likelihoods_local * non_nan_counts_local
-    
+ 
     # Initialize arrays for global sums
     weighted_global = np.zeros_like(weighted_local)
     counts_global = np.zeros_like(non_nan_counts_local)
-
+ 
     # Sum weighted values and counts across all processes
     comm.Allreduce(weighted_local, weighted_global, op=MPI.SUM)
     comm.Allreduce(non_nan_counts_local, counts_global, op=MPI.SUM)
-
-    # Compute global weighted average using JAX operations
+ 
     # Handle division by zero by setting result to NaN where counts are zero
     avg_likelihoods_global = np.where(
         counts_global != 0,
         weighted_global / counts_global,
         np.nan
     )
-
+ 
     log_avg_likelihoods_global = np.log(avg_likelihoods_global)
-
+ 
     return log_avg_likelihoods_global
-
+ 
+ 
 @partial(jit, static_argnames=('n_reals',))
 def _generate_galaxy_property_samples_jax(key, L36, L36_errs, MH1, MH1_err, d, d_err, n_reals):
     """
     Generate random samples for galaxy properties using JAX.
-    
+
+    L36 and MH1 samples remain referenced to the catalogue's fiducial
+    distance. Their common distance rescaling is applied later using
+    q = D_draw / D_fid, so that all distance-dependent quantities use the
+    same Monte Carlo draw.
+
     Args:
         key: JAX random key
-        L36, L36_errs: Disk luminosities and errors (n_galaxies,)
+        L36, L36_errs: 3.6-micron luminosities and errors (n_galaxies,)
         MH1, MH1_err: HI masses and errors (n_galaxies,)
-        d, d_err: Distances and errors (n_galaxies,)
+        d, d_err: Fiducial distances and errors (n_galaxies,)
         n_reals: Number of stellar realizations
-        
+
     Returns:
         dict: Dictionary containing all sampled properties
     """
     n_galaxies = len(L36)
-    
+
     # Split random keys for different sampling operations
     keys = random.split(key, 5)
-    
+
+    sampled_d = (
+        random.normal(keys[0], shape=(n_galaxies, n_reals))
+        * d_err[:, jnp.newaxis]
+        + d[:, jnp.newaxis]
+    )
+    # Gaussian distance draws are physically required to be positive.
+    sampled_d = jnp.where(sampled_d > 0, sampled_d, jnp.nan)
+
     samples = {
-        'd': random.normal(
-            keys[0], shape=(n_galaxies, n_reals)
-        ) * d_err[:, jnp.newaxis] + d[:, jnp.newaxis],
-        
+        'd': sampled_d,
+
         'L36': random.normal(
             keys[1], shape=(n_galaxies, n_reals)
         ) * L36_errs[:, jnp.newaxis] + L36[:, jnp.newaxis],
-        
+
         'M2L_disk': 10**(random.normal(
             keys[2], shape=(n_galaxies, n_reals)
         ) * 0.2 + jnp.log10(0.5)),
-        
+
         'M2L_bulge': 10**(random.normal(
             keys[3], shape=(n_galaxies, n_reals)
         ) * 0.2 + jnp.log10(0.7)),
-        
+
+        # Stored in M_sun at the fiducial catalogue distance. The q^2
+        # rescaling is applied when Mbar and the gas velocity are computed.
         'MH1': (random.normal(
             keys[4], shape=(n_galaxies, n_reals)
         ) * MH1_err[:, jnp.newaxis] + MH1[:, jnp.newaxis]) * 1e9
     }
-    
+
     return samples
-
-
+ 
+ 
 @jit
 def _compute_stellar_masses_jax(samples, Lbulge, d):
     """
     Compute stellar masses from sampled properties using JAX.
-    
+
+    For each realisation, luminosity-derived masses scale as
+    q^2 = (D_draw / D_fid)^2.
+
     Args:
         samples: Dictionary of sampled galaxy properties
-        Lbulge: Bulge luminosities (n_galaxies,)
-        d: Distances (n_galaxies,)
-        
+        Lbulge: Bulge luminosities at the fiducial distance (n_galaxies,)
+        d: Fiducial distances (n_galaxies,)
+
     Returns:
         tuple: (stellar_masses, log_stellar_masses)
     """
+    distance_ratio = samples['d'] / d[:, jnp.newaxis]
+
     Mstellar = jnp.abs(
-        (samples['L36'] - Lbulge[:, jnp.newaxis]) * samples['M2L_disk'] + 
+        (samples['L36'] - Lbulge[:, jnp.newaxis]) * samples['M2L_disk'] +
         Lbulge[:, jnp.newaxis] * samples['M2L_bulge']
-    ) * (d[:, jnp.newaxis] / samples['d'])**2 * 1e9 * 0.7  # M_sun / h
-    
+    ) * distance_ratio**2 * 1e9 * 0.7  # M_sun / h
+
     log_Mstellar = jnp.log10(Mstellar)
-    
+
     return Mstellar, log_Mstellar
-
-
+ 
+ 
 @jit
 def _match_halos_to_galaxies_jax(log_Mstellar, catalog_sc_sorted, sorted_indices):
     """
     Match halos to galaxies based on stellar masses using abundance matching.
-    
+ 
     Args:
         log_Mstellar: Log stellar masses (n_galaxies, n_reals)
         catalog_sc_sorted: Sorted catalog with scatter (n_halos,)
         sorted_indices: Indices for sorting (n_halos,)
-        
+ 
     Returns:
         jnp.ndarray: Indices of matched halos
     """
@@ -135,29 +152,34 @@ def _match_halos_to_galaxies_jax(log_Mstellar, catalog_sc_sorted, sorted_indices
     indices_sorted = jnp.searchsorted(catalog_sc_sorted, log_Mstellar_flat)
     indices_sorted = jnp.clip(indices_sorted, 0, len(catalog_sc_sorted) - 1)
     indices = sorted_indices[indices_sorted].reshape(log_Mstellar.shape)
-    
+ 
     return indices
-
-
+ 
+ 
 @jit
 def nfw_circular_velocity_jax(r, Mvir, Rvir, rs):
     """
-    Calculate the circular velocity for a galaxy using the NFW profile (JAX version).
-    
-    Args:
-        r (jnp.ndarray): Radii at which to calculate the velocity (kpc). Shape: (n_galaxies, n_radii)
-        Mvir (jnp.ndarray): Virial mass of the halo (M_sun). Shape: (n_galaxies, n_stellar_reals)
-        Rvir (jnp.ndarray): Virial radius of the halo (kpc). Shape: (n_galaxies, n_stellar_reals)
-        rs (jnp.ndarray): Scale radius of the halo (kpc). Shape: (n_galaxies, n_stellar_reals)
-        
-    Returns:
-        jnp.ndarray: Circular velocities at the given radii (km/s). Shape: (n_galaxies, n_stellar_reals, n_radii)
-    """
+    Calculate the circular velocity for an NFW halo (JAX version).
 
-    rads_expanded = r[:, jnp.newaxis, :]  # Shape: (n_galaxies, 1, n_radii)
-    Mvir_expanded = Mvir[:, :, jnp.newaxis]  # Shape: (n_galaxies, n_stellar_reals, 1)
-    Rvir_expanded = Rvir[:, :, jnp.newaxis]  # Shape: (n_galaxies, n_stellar_reals, 1)
-    rs_expanded = rs[:, :, jnp.newaxis]  # Shape: (n_galaxies, n_stellar_reals, 1)
+    Args:
+        r (jnp.ndarray): Realisation-dependent physical radii in kpc,
+            shape (n_galaxies, n_stellar_reals, n_radii). A legacy
+            (n_galaxies, n_radii) array is also accepted and broadcast.
+        Mvir (jnp.ndarray): Virial mass of the halo (M_sun),
+            shape (n_galaxies, n_stellar_reals).
+        Rvir (jnp.ndarray): Virial radius of the halo (kpc),
+            shape (n_galaxies, n_stellar_reals).
+        rs (jnp.ndarray): NFW scale radius of the halo (kpc),
+            shape (n_galaxies, n_stellar_reals).
+
+    Returns:
+        jnp.ndarray: Circular velocities, shape
+            (n_galaxies, n_stellar_reals, n_radii).
+    """
+    rads_expanded = r[:, jnp.newaxis, :] if r.ndim == 2 else r
+    Mvir_expanded = Mvir[:, :, jnp.newaxis]
+    Rvir_expanded = Rvir[:, :, jnp.newaxis]
+    rs_expanded = rs[:, :, jnp.newaxis]
 
     # Calculate NFW profile components
     x = rads_expanded / Rvir_expanded
@@ -165,337 +187,526 @@ def nfw_circular_velocity_jax(r, Mvir, Rvir, rs):
 
     # Calculate circular velocity
     vc = jnp.sqrt((G * Mvir_expanded / rads_expanded) *
-                 (jnp.log(1 + c * x) - c * x / (1 + c * x)) /
-                 (jnp.log(1 + c) - c / (1 + c)))
+                  (jnp.log(1 + c * x) - c * x / (1 + c * x)) /
+                  (jnp.log(1 + c) - c / (1 + c)))
     return vc
-
-
+ 
+ 
 @jit
 def nfw_circular_velocity_from_mhi_jax(r, mhi, fb, Mvir):
     """
     Calculate circular velocity using enclosed dark matter mass (JAX version).
-    
+
     Args:
-        r (jnp.ndarray): Radii at which to calculate the velocity (kpc), shape (n_galaxies, n_radii)
-        mhi (jnp.ndarray): Dark matter mass fraction (unitless), shape (n_galaxies, n_stellar_reals, n_radii)
-        fb (jnp.ndarray): Baryon fraction (unitless), shape (n_galaxies, n_stellar_reals)
-        Mvir (jnp.ndarray): Virial mass of the halo (M_sun), shape (n_galaxies, n_stellar_reals).
+        r (jnp.ndarray): Realisation-dependent physical radii in kpc,
+            shape (n_galaxies, n_stellar_reals, n_radii). A legacy
+            (n_galaxies, n_radii) array is also accepted and broadcast.
+        mhi (jnp.ndarray): Dark matter mass fraction (unitless), shape
+            (n_galaxies, n_stellar_reals, n_radii).
+        fb (jnp.ndarray): Baryon fraction (unitless), shape
+            (n_galaxies, n_stellar_reals).
+        Mvir (jnp.ndarray): Virial mass of the halo (M_sun), shape
+            (n_galaxies, n_stellar_reals).
 
     Returns:
-        jnp.ndarray: Circular velocities at the given radii (km/s), shape (n_galaxies, n_stellar_reals, n_radii).
+        jnp.ndarray: Circular velocities, shape
+            (n_galaxies, n_stellar_reals, n_radii).
     """
-    n_galaxies, n_stellar_reals, n_radii = mhi.shape
+    rads_expanded = r[:, jnp.newaxis, :] if r.ndim == 2 else r
+    fb_expanded = fb[:, :, jnp.newaxis]
+    Mvir_expanded = Mvir[:, :, jnp.newaxis]
 
-    rads_expanded = r[:, jnp.newaxis, :]  # Shape: (n_galaxies, 1, n_radii)
-    fb_expanded = fb[:, :, jnp.newaxis]  # Shape: (n_galaxies, n_stellar_reals, 1)
-    Mvir_expanded = Mvir[:, :, jnp.newaxis]  # Shape: (n_galaxies, n_stellar_reals, 1)
-    
-    # check for fb = 1 cases
+    # Check for fb = 1 cases.
     valid_mask = fb_expanded != 1
 
-    denominator  = jnp.where(valid_mask, 1 - fb_expanded, 1)
+    denominator = jnp.where(valid_mask, 1 - fb_expanded, 1)
     M_enclosed = jnp.where(valid_mask, mhi / denominator * Mvir_expanded, jnp.nan)
 
     vc = jnp.where(valid_mask, jnp.sqrt(G * M_enclosed / rads_expanded), jnp.nan)
 
     return vc
-
-
+ 
+ 
 @partial(jit, static_argnames=('emulator',))
 def nfw_circular_velocity_contra_jax(r, Reff, Rvir, rs, Mvir, Mbar, emulator):
     """
-    Calculate the circular velocity using NFW profile + halo contraction/expansion (JAX version).
-    
+    Calculate the circular velocity using NFW plus halo response.
+
     Args:
-        r (jnp.ndarray): Radii at which to calculate the velocity (kpc). Shape: (n_galaxies, n_radii)
-        Reff (float): Effective radius of the galaxy (kpc). (1D array of length n_galaxies).
-        Rvir (jnp.ndarray): Virial radius of the halo (kpc). Shape: (n_galaxies, n_stellar_reals)
-        rs (jnp.ndarray): Scale radius of the halo (kpc). Shape: (n_galaxies, n_stellar_reals)
-        Mvir (jnp.ndarray): Virial mass of the halo (M_sun). Shape: (n_galaxies, n_stellar_reals)
-        Mbar (jnp.ndarray): Baryon mass of the galaxy (M_sun). Shape: (n_galaxies, n_stellar_reals)
+        r (jnp.ndarray): Realisation-dependent physical radii in kpc,
+            shape (n_galaxies, n_stellar_reals, n_radii). A legacy
+            (n_galaxies, n_radii) array is also accepted and broadcast.
+        Reff (jnp.ndarray): Realisation-dependent effective radii in kpc,
+            shape (n_galaxies, n_stellar_reals). A legacy one-dimensional
+            array is also accepted and broadcast.
+        Rvir (jnp.ndarray): Virial radius of the halo (kpc), shape
+            (n_galaxies, n_stellar_reals).
+        rs (jnp.ndarray): NFW scale radius of the halo (kpc), shape
+            (n_galaxies, n_stellar_reals).
+        Mvir (jnp.ndarray): Virial mass of the halo (M_sun), shape
+            (n_galaxies, n_stellar_reals).
+        Mbar (jnp.ndarray): Baryon mass of the galaxy (M_sun), shape
+            (n_galaxies, n_stellar_reals).
         emulator: Emulator function for interpolating log(mhi).
-        
+
     Returns:
-        jnp.ndarray: Circular velocities at the given radii (km/s). Shape: (n_galaxies, n_stellar_reals, n_radii)
+        jnp.ndarray: Circular velocities, shape
+            (n_galaxies, n_stellar_reals, n_radii).
     """
-    rb = Reff[:, jnp.newaxis] / 1.67835
+    rads_expanded = r[:, jnp.newaxis, :] if r.ndim == 2 else r
+    Reff_expanded = Reff[:, jnp.newaxis] if Reff.ndim == 1 else Reff
+
+    rb = Reff_expanded / 1.67835
     c = Rvir / rs
     fb = Mbar / (Mvir + Mbar)
     rb_uless = rb / Rvir
 
-    rads_expanded = r[:, jnp.newaxis, :]  # Shape: (n_galaxies, 1, n_radii)
-    Rvir_expanded = Rvir[:, :, jnp.newaxis]  # Shape: (n_galaxies, n_stellar_reals, 1)
-
+    Rvir_expanded = Rvir[:, :, jnp.newaxis]
     rads_uless = rads_expanded / Rvir_expanded
 
-    c_expanded = c[:, :, jnp.newaxis]  # Shape: (n_galaxies, n_stellar_reals, 1)
-    fb_expanded = fb[:, :, jnp.newaxis]  # Shape: (n_galaxies, n_stellar_reals, 1)
-    rb_uless_expanded = rb_uless[:, :, jnp.newaxis]  # Shape: (n_galaxies, n_stellar_reals, 1)
+    c_expanded = c[:, :, jnp.newaxis]
+    fb_expanded = fb[:, :, jnp.newaxis]
+    rb_uless_expanded = rb_uless[:, :, jnp.newaxis]
 
-    # Prepare arrays for emulator input
+    # Prepare arrays for emulator input.
     logc_extended = jnp.broadcast_to(jnp.log10(c_expanded), rads_uless.shape)
     logfb_extended = jnp.broadcast_to(jnp.log10(fb_expanded), rads_uless.shape)
     logrb_extended = jnp.broadcast_to(jnp.log10(rb_uless_expanded), rads_uless.shape)
     lograds_extended = jnp.log10(rads_uless)
 
-    # Build the points array for emulator
     points = jnp.stack([
         logc_extended.ravel(),
         logfb_extended.ravel(),
         logrb_extended.ravel(),
         lograds_extended.ravel()
     ]).T
-    
-    # Call the emulator
+
     logmhi = emulator(points)
     logmhi = logmhi.reshape(rads_uless.shape)
     mhi = 10**logmhi
-    
-    vc = nfw_circular_velocity_from_mhi_jax(r, mhi, fb, Mvir)
+
+    vc = nfw_circular_velocity_from_mhi_jax(rads_expanded, mhi, fb, Mvir)
     return vc
-
-
-# JIT this function with static arguments for better performance
+ 
+ 
 @partial(jit, static_argnames=('nu', 'emulator'))
-def _compute_rotation_curve_for_galaxy_jax(mass_model_data, samples, 
-                                         Mstellar, halo_data, Reff, nu, emulator):
+def _compute_rotation_curve_diagnostics_jax(
+        mass_model_data, samples, Mstellar, halo_data,
+        L36, Lbulge, MH1, d, Reff, nu, emulator):
     """
-    Compute rotation curve for a single galaxy (JAX version).
-    
-    Args:
-        mass_model_data: Mass model data for all galaxies
-        samples: Dictionary of sampled properties
-        Mstellar: Stellar masses
-        halo_data: Halo data for this galaxy
-        Reff: Effective radius
-        nu: Contraction/expansion parameter
-        emulator: Emulator function
-        
+    Compute total and component rotation-curve diagnostics for all galaxies.
+
+    All distance-dependent quantities use the same Monte Carlo distance draw.
+    The returned arrays have shape (n_galaxies, n_stellar_reals).
+
     Returns:
-        jnp.ndarray: Maximum circular velocities
+        tuple:
+            Vmax: maximum total circular velocity (km/s)
+            Mbar: total baryonic mass (M_sun)
+            Vdm_max: maximum dark-matter circular velocity (km/s)
+            Vbar_max: maximum baryonic circular velocity (km/s)
     """
-    r = mass_model_data['R']  # kpc
-    Vgas = mass_model_data['Vgas']  # km/s
-    Vdisk = mass_model_data['Vdisk']  # km/s
-    Vbul = mass_model_data['Vbul']  # km/s
+    r_fid = mass_model_data['R']
+    Vgas = mass_model_data['Vgas']
+    Vdisk = mass_model_data['Vdisk']
+    Vbul = mass_model_data['Vbul']
 
-    # Compute baryon mass and halo properties
-    Mbar = Mstellar / 0.7 + 1.33 * samples['MH1']  # M_sun
-    Mvir = halo_data['Mvir'] / 0.7  
-    Rvir = halo_data['Rvir'] / 0.7  
-    rs = halo_data['rs'] / 0.7 
+    distance_ratio = samples['d'] / d[:, jnp.newaxis]
+    q_expanded = distance_ratio[:, :, jnp.newaxis]
 
-    # Compute dark matter circular velocity using JAX conditional
-    Vdm = jax.lax.cond(
-        nu == 0.0,
-        lambda: nfw_circular_velocity_jax(r, Mvir, Rvir, rs),
-        lambda: nfw_circular_velocity_contra_jax(r, Reff, Rvir, rs, Mvir, Mbar, emulator)
+    # Use the same distance draw for all physical radii and size parameters.
+    r = r_fid[:, jnp.newaxis, :] * q_expanded
+    Reff_draw = Reff[:, jnp.newaxis] * distance_ratio
+
+    # The sampled HI mass is referenced to the fiducial distance, so apply q^2.
+    MH1_draw = samples['MH1'] * distance_ratio**2
+
+    Mbar = Mstellar / 0.7 + 1.33 * MH1_draw
+    Mvir = halo_data['Mvir'] / 0.7
+    Rvir = halo_data['Rvir'] / 0.7
+    rs = halo_data['rs'] / 0.7
+
+    # ``nu`` and ``emulator`` are static JIT arguments, so use a Python
+    # branch. ``lax.cond`` would trace the emulator branch even for nu == 0
+    # and fail when emulator is None.
+    if nu == 0.0:
+        Vdm = nfw_circular_velocity_jax(r, Mvir, Rvir, rs)
+    else:
+        Vdm = nfw_circular_velocity_contra_jax(
+            r, Reff_draw, Rvir, rs, Mvir, Mbar, emulator
+        )
+
+    # Scale each baryonic template by (M_draw / M_fid) / q in V^2.
+    disk_lum_fid = L36 - Lbulge
+    disk_lum_draw = samples['L36'] - Lbulge[:, jnp.newaxis]
+    disk_lum_ratio = jnp.where(
+        disk_lum_fid[:, jnp.newaxis] > 0,
+        disk_lum_draw / disk_lum_fid[:, jnp.newaxis],
+        1.0
     )
-    
-    # Calculate maximum circular velocity
-    Vgas_sq = Vgas[:, jnp.newaxis, :] * jnp.abs(Vgas[:, jnp.newaxis, :])  # shape: (n_galaxies, 1, n_radii)
+    disk_lum_ratio = jnp.maximum(disk_lum_ratio, 0.0)
 
-    Vdisk_sq = (samples['M2L_disk'][:, :, jnp.newaxis] * Vdisk[:, jnp.newaxis, :] *
-                 jnp.abs(Vdisk[:, jnp.newaxis, :]))  # shape: (n_galaxies, n_stellar_reals, n_radii)
+    MH1_fid = MH1[:, jnp.newaxis] * 1e9
+    gas_mass_ratio = jnp.where(
+        MH1_fid > 0,
+        MH1_draw / MH1_fid,
+        1.0
+    )
+    gas_mass_ratio = jnp.maximum(gas_mass_ratio, 0.0)
 
-    Vbul_sq = (samples['M2L_bulge'][:, :, jnp.newaxis] * Vbul[:, jnp.newaxis, :] *
-                 jnp.abs(Vbul[:, jnp.newaxis, :]))  # shape: (n_galaxies, n_stellar_reals, n_radii)
-    
-    Vdm_sq = Vdm * jnp.abs(Vdm)  # shape: (n_galaxies, n_stellar_reals, n_radii)
+    gas_vsq_factor = gas_mass_ratio / distance_ratio
+    disk_vsq_factor = (
+        distance_ratio * disk_lum_ratio * samples['M2L_disk']
+    )
+    bulge_vsq_factor = distance_ratio * samples['M2L_bulge']
 
-    Vtot_sq = Vgas_sq + Vdisk_sq + Vbul_sq + Vdm_sq
+    Vgas_template_sq = Vgas[:, jnp.newaxis, :] * jnp.abs(Vgas[:, jnp.newaxis, :])
+    Vdisk_template_sq = Vdisk[:, jnp.newaxis, :] * jnp.abs(Vdisk[:, jnp.newaxis, :])
+    Vbul_template_sq = Vbul[:, jnp.newaxis, :] * jnp.abs(Vbul[:, jnp.newaxis, :])
 
-    Vmax = jnp.sqrt(jnp.nanmax(Vtot_sq, axis=2))  # shape: (n_galaxies, n_stellar_reals)
+    Vgas_sq = gas_vsq_factor[:, :, jnp.newaxis] * Vgas_template_sq
+    Vdisk_sq = disk_vsq_factor[:, :, jnp.newaxis] * Vdisk_template_sq
+    Vbul_sq = bulge_vsq_factor[:, :, jnp.newaxis] * Vbul_template_sq
+    Vdm_sq = Vdm * jnp.abs(Vdm)
 
+    Vbar_sq = Vgas_sq + Vdisk_sq + Vbul_sq
+    Vtot_sq = Vbar_sq + Vdm_sq
+
+    Vmax = jnp.sqrt(jnp.nanmax(Vtot_sq, axis=2))
+    Vbar_max = jnp.sqrt(jnp.nanmax(Vbar_sq, axis=2))
+    Vdm_max = jnp.nanmax(Vdm, axis=2)
+
+    return Vmax, Mbar, Vdm_max, Vbar_max
+
+
+@partial(jit, static_argnames=('nu', 'emulator'))
+def _compute_rotation_curve_for_galaxy_jax(
+        mass_model_data, samples, Mstellar, halo_data,
+        L36, Lbulge, MH1, d, Reff, nu, emulator):
+    """Velocity-only wrapper used by the likelihood-grid hot path."""
+    Vmax, _, _, _ = _compute_rotation_curve_diagnostics_jax(
+        mass_model_data, samples, Mstellar, halo_data,
+        L36, Lbulge, MH1, d, Reff, nu, emulator
+    )
     return Vmax
 
-
-def compute_AM_realization(key, nu, abundance_match, deconv, emulator, galaxy_data, mass_model_data, 
-                           halo_catalog_data, n_reals):
-    """
-    JAX-optimized version of compute_AM_realization.
-    
-    Args:
-        key: JAX random key
-        nu: Parameter for halo contraction/expansion
-        deconv: Deconvoluted catalog
-        abundance_match: Abundance matching object
-        emulator: Emulator function for rotation curve simulation
-        mass_model_data: Pre-processed mass model data in vectorized format
-                        Dictionary with keys 'R', 'Vgas', 'Vdisk', 'Vbul' 
-                        Each value has shape (n_galaxies, n_radii)
-        halo_catalog: Original halo catalog
-        halo_catalog_data: Pre-processed halo catalog arrays
-        Lbulge, L36, L36_errs: Luminosity data
-        Reff: Effective radii
-        MH1, MH1_err: HI mass data
-        d, d_err: Distance data
-        n_reals: Number of stellar realizations
-        
-    Returns:
-        jnp.ndarray: Simulated maximum circular velocities
-    """
-    # Add scatter to the deconvoluted catalog, and return the catalog of stellar masses matched to halos
-    mask_matched, catalog_Mstar_matched = abundance_match.add_scatter(deconv, cut_range=(3, 12), return_catalog=True)
+def _prepare_am_realization_inputs(key, abundance_match, deconv, galaxy_data,
+                                   halo_catalog_data, n_reals):
+    """Sample galaxy properties and match every draw to a halo."""
+    _, catalog_Mstar_matched = abundance_match.add_scatter(
+        deconv, cut_range=(3, 12), return_catalog=True
+    )
     sorted_indices = np.argsort(catalog_Mstar_matched)
     catalog_Mstar_sorted = catalog_Mstar_matched[sorted_indices]
-    
-    # Generate samples for galaxy properties
+
     samples = _generate_galaxy_property_samples_jax(
-        key, galaxy_data['L36'], galaxy_data['L36_err'], galaxy_data['MH1'], 
+        key, galaxy_data['L36'], galaxy_data['L36_err'], galaxy_data['MH1'],
         galaxy_data['MH1_err'], galaxy_data['d'], galaxy_data['d_err'], n_reals
     )
-    
-    # Compute stellar masses
-    Mstellar, log_Mstellar = _compute_stellar_masses_jax(samples, galaxy_data['Lbulge'], galaxy_data['d'])
-    
-    # Match halos to galaxies
+
+    Mstellar, log_Mstellar = _compute_stellar_masses_jax(
+        samples, galaxy_data['Lbulge'], galaxy_data['d']
+    )
+
     halo_indices = _match_halos_to_galaxies_jax(
-        log_Mstellar, jnp.array(catalog_Mstar_sorted), jnp.array(sorted_indices)
+        log_Mstellar, jnp.asarray(catalog_Mstar_sorted),
+        jnp.asarray(sorted_indices)
     )
-    
-    # Extract matched halo properties
-    keys = ['Mvir', 'Rvir', 'rs', 'select']
-    matched_halo_data = {}
-    for key_name in keys:
-        matched_halo_data[key_name] = halo_catalog_data[key_name][halo_indices]
-    
-    # Compute rotation curves for ALL galaxies simultaneously (VECTORIZED!)
-    # mass_model_data is assumed to be in the correct format already
-    vc = _compute_rotation_curve_for_galaxy_jax(
-        mass_model_data, samples, Mstellar, matched_halo_data, 
-        galaxy_data['Reff'], nu, emulator
-    )
-    
-    # Apply selection mask
-    selection_mask = matched_halo_data['select']
-    vc = vc * selection_mask
-    
-    return vc
+
+    matched_halo_data = {
+        key_name: halo_catalog_data[key_name][halo_indices]
+        for key_name in ('Mvir', 'Rvir', 'rs', 'select')
+    }
+
+    return samples, Mstellar, matched_halo_data
 
 
-def get_loglike_split(V_sims, V_mock, V_mock_err):
+def compute_AM_realization(key, nu, abundance_match, deconv, emulator, galaxy_data,
+                           mass_model_data, halo_catalog_data, n_reals):
     """
-    NumPy version of get_loglike_split for a single truth.
-    
-    Args:
-        V_sims: Simulated velocities (n_galaxies, n_samples)
-        V_mock: Mock observed velocities for one truth (n_galaxies,)
-        V_mock_err: Mock observational errors for one truth (n_galaxies,)
+    Compute one abundance-matching realization and return total Vmax only.
+
+    This signature and return type are intentionally unchanged so existing
+    likelihood-grid and mock-truth drivers continue to work.
+    """
+    samples, Mstellar, matched_halo_data = _prepare_am_realization_inputs(
+        key, abundance_match, deconv, galaxy_data, halo_catalog_data, n_reals
+    )
+
+    Vmax = _compute_rotation_curve_for_galaxy_jax(
+        mass_model_data, samples, Mstellar, matched_halo_data,
+        galaxy_data['L36'], galaxy_data['Lbulge'], galaxy_data['MH1'],
+        galaxy_data['d'], galaxy_data['Reff'], nu, emulator
+    )
+
+    return Vmax * matched_halo_data['select']
+
+
+def compute_AM_realization_diagnostics(
+        key, nu, abundance_match, deconv, emulator, galaxy_data,
+        mass_model_data, halo_catalog_data, n_reals):
+    """
+    Compute one abundance-matching realization with plotting diagnostics.
 
     Returns:
-        tuple: (avg_likelihoods, non_nan_counts) both with shape (n_galaxies,)
+        tuple of JAX arrays (Vmax, Mbar, Vdm_max, Vbar_max), each with shape
+        (n_galaxies, n_reals). The halo-selection mask is applied to every
+        returned quantity.
     """
-    
-    # V_sims: (n_galaxies, n_samples)
-    # V_mock: (n_galaxies,) 
-    # V_mock_err: (n_galaxies,)
-    
+    samples, Mstellar, matched_halo_data = _prepare_am_realization_inputs(
+        key, abundance_match, deconv, galaxy_data, halo_catalog_data, n_reals
+    )
+
+    outputs = _compute_rotation_curve_diagnostics_jax(
+        mass_model_data, samples, Mstellar, matched_halo_data,
+        galaxy_data['L36'], galaxy_data['Lbulge'], galaxy_data['MH1'],
+        galaxy_data['d'], galaxy_data['Reff'], nu, emulator
+    )
+
+    selection_mask = matched_halo_data['select']
+    return tuple(output * selection_mask for output in outputs)
+
+def get_loglike_split(V_sims, V_target, V_target_err):
+    """
+    Per-galaxy sample-averaged log-likelihood for a single target dataset,
+    computed in log space via logsumexp for numerical stability.
+ 
+    Args:
+        V_sims: Simulated log-velocities (n_galaxies, n_samples)
+        V_target: Target log-velocities for one dataset (n_galaxies,)
+        V_target_err: Target log-velocity errors for one dataset (n_galaxies,)
+ 
+    Returns:
+        tuple: (log_avg_likelihoods, non_nan_counts) both with shape (n_galaxies,)
+    """
     # Expand dimensions for broadcasting
-    V_mock_expanded = V_mock[:, np.newaxis]  # Shape: (n_galaxies, 1)
-    V_mock_err_expanded = V_mock_err[:, np.newaxis]  # Shape: (n_galaxies, 1)
-    
-    # Calculate likelihoods for all samples for this single truth
-    #likelihoods = np.exp(-0.5 * ((V_mock_expanded - V_sims) / V_mock_err_expanded)**2) / (
-    #    np.sqrt(2 * np.pi) * V_mock_err_expanded
-    #)  # Shape: (n_galaxies, n_samples)
-
-    # Average likelihood across all samples for each galaxy
-    #avg_likelihoods = np.nanmean(likelihoods, axis=1)  # Shape: (n_galaxies,)
-
-    # Count non-nan values per galaxy
-    #non_nan_counts = np.sum(~np.isnan(likelihoods), axis=1)  # Shape: (n_galaxies,)
-
-    log_likelihoods = -0.5 * ((V_mock_expanded - V_sims) / V_mock_err_expanded)**2 - np.log(np.sqrt(2 * np.pi) * V_mock_err_expanded)
-
+    V_target_expanded = V_target[:, np.newaxis]  # Shape: (n_galaxies, 1)
+    V_target_err_expanded = V_target_err[:, np.newaxis]  # Shape: (n_galaxies, 1)
+ 
+    log_likelihoods = (-0.5 * ((V_target_expanded - V_sims) / V_target_err_expanded)**2
+                       - np.log(np.sqrt(2 * np.pi) * V_target_err_expanded))
+ 
     valid_mask = ~np.isnan(log_likelihoods)
     non_nan_counts = np.sum(valid_mask, axis=1)
-
+ 
     log_avg_likelihoods = np.full(V_sims.shape[0], -np.inf)
-
+ 
     for i in range(V_sims.shape[0]):
         valid_log_likelihoods = log_likelihoods[i, valid_mask[i, :]]
         if len(valid_log_likelihoods) > 0:
-            log_avg_likelihoods[i] = jax.scipy.special.logsumexp(valid_log_likelihoods) - np.log(len(valid_log_likelihoods))
+            log_avg_likelihoods[i] = (jax.scipy.special.logsumexp(valid_log_likelihoods)
+                                      - np.log(len(valid_log_likelihoods)))
         else:
             log_avg_likelihoods[i] = -np.inf
-
+ 
     return log_avg_likelihoods, non_nan_counts
-
-
-# Main computation function that can be called from the existing workflow
-def compute_likelihood(alpha, scatter, nu, abundance_match, emulator, galaxy_data, mass_model_catalog, 
-                       halo_catalog, halo_catalog_data, n_am_reals, n_stellar_reals, size, rank, comm):
+ 
+ 
+def compute_simulated_velocities(key, alpha, scatter, nu, abundance_match, emulator,
+                                 galaxy_data, mass_model_catalog, halo_catalog,
+                                 halo_catalog_data, n_am_reals, n_stellar_reals,
+                                 size, rank):
     """
-    JAX-optimized version of compute_likelihood with improved memory management.
-    
-    This function maintains the same interface as the original but uses JAX for computation.
-    Returns array of log likelihood values for each mock truth (shape: num_truths,).
+    Run the forward model for one (alpha, scatter, nu) grid point and return
+    this rank's local simulated log10(Vmax) samples.
+ 
+    Args:
+        key: JAX PRNG key for this grid point (per-rank stream is derived
+             internally via fold_in, so all ranks may pass the same key).
+        alpha, scatter, nu: Model parameters.
+        abundance_match: Abundance matching object.
+        emulator: Contra emulator callable (or None for nu == 0).
+        galaxy_data: Intrinsic galaxy properties only (see compute_AM_realization).
+        mass_model_catalog: Vectorized mass model data.
+        halo_catalog: Structured halo catalog (for deconvolution).
+        halo_catalog_data: JAX-preprocessed halo catalog arrays.
+        n_am_reals: Total number of AM realizations (split across ranks).
+        n_stellar_reals: Stellar realizations per AM realization.
+        size, rank: MPI layout.
+ 
+    Returns:
+        np.ndarray: Local simulated log10 velocities,
+                    shape (n_galaxies, n_local_am_reals * n_stellar_reals).
     """
-    # Initialize JAX random key
-    key = random.PRNGKey(42 + rank)  # Different seed per process
-    
+    # Derive an independent stream per rank from the grid-point key
+    key = random.fold_in(key, rank)
+ 
     # Generate deconvoluted catalog
     theta = {"alpha": alpha, "scatter": scatter}
     deconv = abundance_match.deconvoluted_catalogs(theta, halo_catalog)
-    
+ 
     # Split realizations across processes
     local_start = rank * n_am_reals // size
     local_end = (rank + 1) * n_am_reals // size if rank < size - 1 else n_am_reals
-    local_realizations = jnp.arange(local_start, local_end)
-    
-    # Compute local results using JAX with memory optimization
+    n_local = local_end - local_start
+ 
     local_results = []
-    n_galaxies = len(galaxy_data['L36'])
-    
-    for i in range(len(local_realizations)):
+ 
+    for _ in range(n_local):
         key, subkey = random.split(key)
-        
+ 
         result = compute_AM_realization(
-            subkey, nu, abundance_match, deconv, emulator, galaxy_data, mass_model_catalog, 
-            halo_catalog_data, n_stellar_reals
+            subkey, nu, abundance_match, deconv, emulator, galaxy_data,
+            mass_model_catalog, halo_catalog_data, n_stellar_reals
         )
-        
-        # Convert to regular numpy to save memory and avoid JAX overhead
+ 
         local_results.append(result)
-
-    # Prepare data for gathering using NumPy operations
+ 
+    # Stack, log, and flatten the (AM realization, stellar realization) axes
     local_vc_numpy = np.array([np.array(result) for result in local_results])
-    
-    # Reshape and process using NumPy
-    V_sims_local_numpy = np.log10(np.transpose(local_vc_numpy, (1, 0, 2)))
-    V_sims_local_numpy = V_sims_local_numpy.reshape(len(galaxy_data['L36']), -1)
+    V_sims_local = np.log10(np.transpose(local_vc_numpy, (1, 0, 2)))
+    V_sims_local = V_sims_local.reshape(V_sims_local.shape[0], -1)
+ 
+    return V_sims_local
+ 
 
-    # if Vmax_shift_mode: not available 
-    # mean_V_obs = np.mean(V_obs_numpy)
-    # mean_V_sims = np.nanmean(V_sims_local_numpy)
-    # shift = mean_V_obs - mean_V_sims
-    # V_sims_mode = V_sims_local_numpy + shift
+def compute_simulated_diagnostics(
+        key, alpha, scatter, nu, abundance_match, emulator, galaxy_data,
+        mass_model_catalog, halo_catalog, halo_catalog_data,
+        n_am_reals, n_stellar_reals, size, rank):
+    """
+    Run one model point and return this rank's local plotting diagnostics.
 
-    # V_mocks and V_mocks_err now have shape (num_truths, n_galaxies)
-    num_truths = galaxy_data['log_Vmocks'].shape[0]
-    log_likelihoods = []
-    
-    for truth_idx in range(num_truths):
+    Unlike ``compute_simulated_velocities``, values are returned in linear
+    units and include baryonic masses and component maxima. The sample axis
+    combines local AM realizations and stellar-property realizations.
 
-        # Call the per-truth function
-        log_avg_likelihoods_local, non_nan_counts_local = get_loglike_split(
-            V_sims_local_numpy, galaxy_data['log_Vmocks'][truth_idx], galaxy_data['log_Vmocks_err'][truth_idx]
+    Returns:
+        dict with keys ``Vmax``, ``Mbar``, ``Vdm_max`` and ``Vbar_max``.
+        Every value has shape (n_galaxies, n_local_samples).
+    """
+    key = random.fold_in(key, rank)
+
+    theta = {"alpha": alpha, "scatter": scatter}
+    deconv = abundance_match.deconvoluted_catalogs(theta, halo_catalog)
+
+    local_start = rank * n_am_reals // size
+    local_end = ((rank + 1) * n_am_reals // size
+                 if rank < size - 1 else n_am_reals)
+    n_local = local_end - local_start
+    n_galaxies = int(galaxy_data['L36'].shape[0])
+
+    names = ('Vmax', 'Mbar', 'Vdm_max', 'Vbar_max')
+    if n_local == 0:
+        return {
+            name: np.empty((n_galaxies, 0), dtype=np.float64)
+            for name in names
+        }
+
+    local_results = []
+    for _ in range(n_local):
+        key, subkey = random.split(key)
+        local_results.append(
+            compute_AM_realization_diagnostics(
+                subkey, nu, abundance_match, deconv, emulator, galaxy_data,
+                mass_model_catalog, halo_catalog_data, n_stellar_reals
+            )
         )
 
-        # Compute global weighted average using MPI for this specific mock truth
+    diagnostics = {}
+    for output_index, name in enumerate(names):
+        stacked = np.stack(
+            [np.asarray(result[output_index]) for result in local_results],
+            axis=0
+        )
+        diagnostics[name] = np.transpose(stacked, (1, 0, 2)).reshape(
+            n_galaxies, -1
+        )
+
+    return diagnostics
+
+def evaluate_likelihoods(V_sims_local, log_V_targets, log_V_targets_err, comm):
+    """
+    Evaluate the log-likelihood of one or more target datasets against a set
+    of local simulated velocities, combining across MPI ranks with a
+    count-weighted average.
+ 
+    The targets are explicit arguments: pass the observed SPARC data (a
+    single dataset) or a mock-truth ensemble (many datasets). This function
+    is agnostic to which it is.
+ 
+    Args:
+        V_sims_local (np.ndarray): Local simulated log-velocities,
+            shape (n_galaxies, n_local_samples).
+        log_V_targets (np.ndarray): Target log-velocities,
+            shape (n_galaxies,) for a single dataset or
+            (num_targets, n_galaxies) for an ensemble.
+        log_V_targets_err (np.ndarray): Target log-velocity errors,
+            same shape as log_V_targets.
+        comm (MPI.Comm): MPI communicator.
+ 
+    Returns:
+        np.ndarray: Log-likelihoods, shape (num_targets,). All ranks return
+            the same values (the reduction uses Allreduce).
+    """
+    log_V_targets = np.atleast_2d(np.asarray(log_V_targets, dtype=np.float64))
+    log_V_targets_err = np.atleast_2d(np.asarray(log_V_targets_err, dtype=np.float64))
+ 
+    if log_V_targets.shape != log_V_targets_err.shape:
+        raise ValueError(
+            f"Target and error arrays must have the same shape, got "
+            f"{log_V_targets.shape} and {log_V_targets_err.shape}"
+        )
+    if log_V_targets.shape[1] != V_sims_local.shape[0]:
+        raise ValueError(
+            f"Targets have {log_V_targets.shape[1]} galaxies but simulations "
+            f"have {V_sims_local.shape[0]}"
+        )
+ 
+    num_targets = log_V_targets.shape[0]
+    log_likelihoods = np.empty(num_targets)
+ 
+    for target_idx in range(num_targets):
+        # Per-galaxy averaged likelihood over this rank's samples
+        log_avg_likelihoods_local, non_nan_counts_local = get_loglike_split(
+            V_sims_local, log_V_targets[target_idx], log_V_targets_err[target_idx]
+        )
+ 
+        # Combine across ranks with a count-weighted average
         individual_log_likelihoods = mpi_weighted_average(
             log_avg_likelihoods_local, non_nan_counts_local, comm
         )  # Shape: (n_galaxies,)
-
-        # Compute log likelihood for this specific mock truth
-        log_likelihood = np.sum(individual_log_likelihoods)  # Scalar
-        log_likelihoods.append(float(log_likelihood))  # Convert to Python float
-
-    # Clean up large arrays
-    del local_results, local_vc_numpy, V_sims_local_numpy
-    
+ 
+        # Total log-likelihood for this target: sum over galaxies
+        log_likelihoods[target_idx] = float(np.sum(individual_log_likelihoods))
+ 
+    return log_likelihoods
+ 
+ 
+def compute_likelihood(key, alpha, scatter, nu, abundance_match, emulator, galaxy_data,
+                       mass_model_catalog, halo_catalog, halo_catalog_data,
+                       log_V_targets, log_V_targets_err,
+                       n_am_reals, n_stellar_reals, size, rank, comm):
+    """
+    Forward model + likelihood evaluation for one grid point.
+ 
+    Thin composition of compute_simulated_velocities and evaluate_likelihoods.
+    Target velocities (observed data or mock ensemble) are explicit arguments;
+    galaxy_data carries intrinsic galaxy properties only.
+ 
+    Args:
+        log_V_targets, log_V_targets_err: shape (n_galaxies,) or
+            (num_targets, n_galaxies). See evaluate_likelihoods.
+        key: JAX PRNG key for this grid point (same key on all ranks).
+        (remaining arguments as in compute_simulated_velocities)
+ 
+    Returns:
+        np.ndarray of shape (num_targets,) on rank 0, None on other ranks.
+    """
+    V_sims_local = compute_simulated_velocities(
+        key, alpha, scatter, nu, abundance_match, emulator,
+        galaxy_data, mass_model_catalog, halo_catalog, halo_catalog_data,
+        n_am_reals, n_stellar_reals, size, rank
+    )
+ 
+    log_likelihoods = evaluate_likelihoods(
+        V_sims_local, log_V_targets, log_V_targets_err, comm
+    )
+ 
+    # Clean up the large simulation array
+    del V_sims_local
+ 
     if rank == 0:
-        return np.array(log_likelihoods)  # Shape: (num_truths,)
+        return log_likelihoods
     else:
         return None
