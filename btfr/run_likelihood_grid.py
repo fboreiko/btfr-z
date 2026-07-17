@@ -109,16 +109,11 @@ class SparcLikelihoodGrid:
 
         # Scale stellar realizations with x so the post-selection sample size
         # stays constant across the x grid
-        n_stellar_reals_minx = int(
-            self.config.n_stellar_reals *
-            (1 - np.max(self.x_values)) / (1 - np.min(self.x_values))
-        )
-        self.n_stellar_range = np.floor(
-            np.linspace(n_stellar_reals_minx, self.config.n_stellar_reals, self.config.grid_size)
+        target_postselection = self.config.n_stellar_reals * (1.0 - np.max(self.x_values))
+        self.n_stellar_range = np.ceil(
+            target_postselection / (1.0 - self.x_values)
         ).astype(int)
-        self.n_stellar_reals_postselection = int(
-            n_stellar_reals_minx * (1 - np.min(self.x_values))
-        )
+        self.n_stellar_reals_postselection = int(round(target_postselection))
 
     def _setup_x_chunking(self):
         """Setup x value chunking parameters."""
@@ -343,10 +338,6 @@ class SparcLikelihoodGrid:
                                     likelihood_grid[i_alpha, i_scatter, local_i_x, i_nu] = \
                                         likelihoods[0]
                                     pbar.update(1)
-
-                                    print(f"Computed likelihood for alpha={alpha:.3f}, scatter={scatter:.3f}, x={x:.3f}, nu={nu:.3f}: {likelihoods[0]:.6f}")
-
-                                    exit()
 
                             except Exception as e:
                                 if self.rank == 0:

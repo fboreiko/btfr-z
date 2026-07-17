@@ -27,7 +27,7 @@ from matplotlib import rcParams
 
 from BAM import AbundanceMatch, proxies
 from utils import *
-from btfr.forward_model import (
+from forward_model import (
     compute_simulated_diagnostics,
     evaluate_likelihoods,
 )
@@ -444,9 +444,9 @@ def main():
     config = SingleModelConfig(
         n_am_reals=100,
         n_stellar_reals=1000,
-        alpha_proxy=0.0,
-        scatter=0.19,
-        x=0.84,
+        alpha_proxy=-1.57,
+        scatter=0.8,
+        x=0.0,
         nu=0.430, #float(np.linspace(-3.0, 3.0, 20)[10]),
         base_seed=42,
         vmax_shift_mode=False,
