@@ -13,38 +13,107 @@ G = 4.30091e-6  # Gravitational constant in kpc * (km/s)^2 / M_sun
  
 def mpi_weighted_average(log_avg_likelihoods_local, non_nan_counts_local, comm):
     """
-    Compute global weighted average using MPI.Allreduce.
- 
+    Combine per-rank, per-galaxy average log-likelihoods without
+    exponentiating very negative absolute log-likelihoods.
+
+    For each galaxy, this computes
+
+        log[sum_r N_r * exp(log_Lbar_r) / sum_r N_r]
+
+    using a global per-galaxy max shift.
+
     Args:
-        log_avg_likelihoods_local (np.ndarray): Local averaged log-likelihoods, shape (n_galaxies,)
-        non_nan_counts_local (np.ndarray): Local non-NaN counts, shape (n_galaxies,)
-        comm (MPI.Comm): MPI communicator
- 
+        log_avg_likelihoods_local:
+            Per-galaxy log of the average likelihood on this rank,
+            shape (n_galaxies,).
+        non_nan_counts_local:
+            Number of valid samples contributing on this rank,
+            shape (n_galaxies,).
+        comm:
+            MPI communicator.
+
     Returns:
-        np.ndarray: Global weighted averaged log-likelihoods, shape (n_galaxies,)
+        Global per-galaxy average log-likelihoods,
+        shape (n_galaxies,).
     """
- 
-    avg_likelihoods_local = np.exp(log_avg_likelihoods_local)
- 
-    weighted_local = avg_likelihoods_local * non_nan_counts_local
- 
-    # Initialize arrays for global sums
-    weighted_global = np.zeros_like(weighted_local)
+    log_avg_likelihoods_local = np.asarray(
+        log_avg_likelihoods_local,
+        dtype=np.float64
+    )
+    non_nan_counts_local = np.asarray(non_nan_counts_local)
+
+    # Ranks with no valid samples must not participate in the maximum.
+    local_max_input = np.where(
+        non_nan_counts_local > 0,
+        log_avg_likelihoods_local,
+        -np.inf
+    )
+
+    # Find the global per-galaxy reference value.
+    global_log_max = np.empty_like(log_avg_likelihoods_local)
+    comm.Allreduce(
+        local_max_input,
+        global_log_max,
+        op=MPI.MAX
+    )
+
+    # Compute the count-weighted likelihood after subtracting the global max.
+    # At least one contributing rank has exponent zero for each valid galaxy,
+    # so the global shifted sum cannot underflow to zero.
+    shifted_weighted_local = np.zeros_like(log_avg_likelihoods_local)
+
+    valid_local = (
+        (non_nan_counts_local > 0)
+        & np.isfinite(global_log_max)
+    )
+
+    shifted_weighted_local[valid_local] = (
+        non_nan_counts_local[valid_local]
+        * np.exp(
+            log_avg_likelihoods_local[valid_local]
+            - global_log_max[valid_local]
+        )
+    )
+
+    shifted_weighted_global = np.zeros_like(shifted_weighted_local)
     counts_global = np.zeros_like(non_nan_counts_local)
- 
-    # Sum weighted values and counts across all processes
-    comm.Allreduce(weighted_local, weighted_global, op=MPI.SUM)
-    comm.Allreduce(non_nan_counts_local, counts_global, op=MPI.SUM)
- 
-    # Handle division by zero by setting result to NaN where counts are zero
-    avg_likelihoods_global = np.where(
-        counts_global != 0,
-        weighted_global / counts_global,
+
+    comm.Allreduce(
+        shifted_weighted_local,
+        shifted_weighted_global,
+        op=MPI.SUM
+    )
+    comm.Allreduce(
+        non_nan_counts_local,
+        counts_global,
+        op=MPI.SUM
+    )
+
+    # Restore the removed maximum and divide by the total sample count,
+    # remaining in log space throughout.
+    log_avg_likelihoods_global = np.full_like(
+        log_avg_likelihoods_local,
         np.nan
     )
- 
-    log_avg_likelihoods_global = np.log(avg_likelihoods_global)
- 
+
+    valid_global = ((counts_global > 0)
+        & np.isfinite(global_log_max)
+        & (shifted_weighted_global > 0)
+    )
+
+    log_avg_likelihoods_global[valid_global] = (
+        global_log_max[valid_global]
+        + np.log(shifted_weighted_global[valid_global])
+        - np.log(counts_global[valid_global])
+    )
+
+    # This case would mean all contributing ranks supplied -inf.
+    all_zero_global = (
+        (counts_global > 0)
+        & np.isneginf(global_log_max)
+    )
+    log_avg_likelihoods_global[all_zero_global] = -np.inf
+
     return log_avg_likelihoods_global
  
  

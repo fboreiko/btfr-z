@@ -1,7 +1,7 @@
 """
 SPARC BTFR likelihood grid using the modular JAX pipeline.
 
-Run with e.g.:  mpiexec -n 4 python btfr_grid_jax.py
+Run with e.g.:  mpiexec -n 4 python run_likelihood_grid.py
 """
 
 import gc
@@ -27,40 +27,54 @@ from btfr.forward_model import compute_likelihood
 
 @dataclass
 class SparcGridConfig:
-    """Configuration for the SPARC BTFR likelihood grid."""
+    """Configuration for the SPARC BTFR likelihood grid (selection model)."""
 
-    n_am_reals: int = 5
-    n_stellar_reals: int = 100
+    n_am_reals: int = 100
 
-    # Grid search parameters
-    alpha_proxy_range: Tuple[float, float] = (-np.pi / 2, np.pi / 2)
-    scatter_range: Tuple[float, float] = (0.01, 1.0)
-    x_range: Tuple[float, float] = (0.0, 0.95)
-    nu_range: Tuple[float, float] = (-3.0, 3.0)
-    grid_size: int = 20
+    # Target number of *accepted* (post-selection) stellar samples per AM
+    # realization. Raw draws are scaled as target / (1 - x) so the expected
+    # post-selection sample count is constant across the x grid.
+    n_postselection_target: int = 500
+
+    # Memory/JIT cap on raw stellar draws per forward-model call. When
+    # target / (1 - x) exceeds this, the shortfall is made up by running
+    # proportionally more AM realizations instead.
+    n_stellar_max_per_call: int = 5000
+
+    # Grid axes: (min, max) range and number of nodes per dimension.
+    alpha_proxy_range: Tuple[float, float] = (-np.pi / 2 + 0.01, np.pi / 2 - 0.01)
+    n_alpha: int = 20
+    scatter_range: Tuple[float, float] = (0.01, 0.8)
+    n_scatter: int = 20
+    x_range: Tuple[float, float] = (0.5, 0.99)
+    n_x: int = 29
+    nu_range: Tuple[float, float] = (-0.8, 1.6)
+    n_nu: int = 25
 
     # Chunking parameters (split the x dimension across independent jobs)
     x_chunk_size: int = 5   # number of x values to process in this job
     x_chunk_start: int = 0  # starting x index for this job (0-based)
 
-    # Randomness: fixed base seed -> fully reproducible, while fold_in on
-    # (rank, x, nu, alpha, scatter) guarantees independent streams across
-    # grid points and across separately-run chunks.
     base_seed: int = 42
 
     vmax_shift_mode: bool = False  # see note in compute_likelihood_grid()
     output_dir: str = "."
 
     def __post_init__(self):
-        """Validate configuration and set derived parameters."""
-        if self.n_am_reals <= 0 or self.n_stellar_reals <= 0:
+        """Validate configuration."""
+        if self.n_am_reals <= 0 or self.n_postselection_target <= 0:
             raise ValueError("Number of realizations must be positive")
-        if self.grid_size <= 0:
-            raise ValueError("Grid size must be positive")
+        if self.n_stellar_max_per_call <= 0:
+            raise ValueError("n_stellar_max_per_call must be positive")
+        for name in ("n_alpha", "n_scatter", "n_x", "n_nu"):
+            if getattr(self, name) <= 0:
+                raise ValueError(f"{name} must be positive")
         if self.x_chunk_size <= 0:
             raise ValueError("X chunk size must be positive")
-        if self.x_chunk_start < 0 or self.x_chunk_start >= self.grid_size:
-            raise ValueError(f"X chunk start must be between 0 and {self.grid_size - 1}")
+        if self.x_chunk_start < 0 or self.x_chunk_start >= self.n_x:
+            raise ValueError(f"X chunk start must be between 0 and {self.n_x - 1}")
+        if not (0.0 <= self.x_range[0] < self.x_range[1] < 1.0):
+            raise ValueError("x_range must satisfy 0 <= x_min < x_max < 1")
 
 class SparcLikelihoodGrid:
     """Computes the BTFR likelihood grid against the observed SPARC sample."""
@@ -71,8 +85,7 @@ class SparcLikelihoodGrid:
         self.rank = self.comm.Get_rank()
         self.size = self.comm.Get_size()
 
-        # Master PRNG key lives with the driver (same pattern as MockTruthTester).
-        self.master_key = random.PRNGKey(config.base_seed)
+        self.base_key = random.PRNGKey(config.base_seed)
 
         # Initialize grid parameters
         self._setup_grid_parameters()
@@ -83,49 +96,71 @@ class SparcLikelihoodGrid:
         # Load contra emulator grids
         self.contra_grids, self.grid_axes = load_emulators()
 
-    def _setup_grid_parameters(self):
-        """Initialize grid parameter arrays."""
-        self.alpha_proxy_values = np.linspace(
-            self.config.alpha_proxy_range[0],
-            self.config.alpha_proxy_range[1],
-            self.config.grid_size
-        )
-        self.alpha_values = np.tan(self.alpha_proxy_values)
-        self.scatter_values = np.linspace(
-            self.config.scatter_range[0],
-            self.config.scatter_range[1],
-            self.config.grid_size
-        )
-        self.x_values = np.linspace(
-            self.config.x_range[0],
-            self.config.x_range[1],
-            self.config.grid_size
-        )
-        self.nu_values = np.linspace(
-            self.config.nu_range[0],
-            self.config.nu_range[1],
-            self.config.grid_size
-        )
+        # Fail fast (on all ranks) if any grid nu lacks a trained contra grid
+        self._validate_contra_grids()
 
-        # Scale stellar realizations with x so the post-selection sample size
-        # stays constant across the x grid
-        target_postselection = self.config.n_stellar_reals * (1.0 - np.max(self.x_values))
-        self.n_stellar_range = np.ceil(
-            target_postselection / (1.0 - self.x_values)
+    def _setup_grid_parameters(self):
+        """Initialize per-dimension grid parameter arrays."""
+        cfg = self.config
+        self.alpha_proxy_values = np.linspace(*cfg.alpha_proxy_range, cfg.n_alpha)
+        self.alpha_values = np.tan(self.alpha_proxy_values)
+        self.scatter_values = np.linspace(*cfg.scatter_range, cfg.n_scatter)
+        self.x_values = np.linspace(*cfg.x_range, cfg.n_x)
+        self.nu_values = np.linspace(*cfg.nu_range, cfg.n_nu)
+
+        # Raw stellar draws needed per AM realization for a constant expected
+        # post-selection count: n_raw(x) = target / (1 - x).
+        n_raw_needed = np.ceil(
+            cfg.n_postselection_target / (1.0 - self.x_values)
         ).astype(int)
-        self.n_stellar_reals_postselection = int(round(target_postselection))
+
+        # Cap raw draws per call; make up the shortfall with extra AM
+        # realizations so the total budget n_am * n_stellar is preserved.
+        self.n_stellar_range = np.minimum(n_raw_needed, cfg.n_stellar_max_per_call)
+        self.n_am_range = np.ceil(
+            cfg.n_am_reals * n_raw_needed / self.n_stellar_range
+        ).astype(int)
+
+        # Every rank must receive at least one AM realization, otherwise the
+        # empty-stack path in compute_simulated_velocities fails.
+        self.n_am_range = np.maximum(self.n_am_range, self.size)
+
+        self.n_stellar_reals_postselection = int(cfg.n_postselection_target)
 
     def _setup_x_chunking(self):
         """Setup x value chunking parameters."""
         x_end = min(self.config.x_chunk_start + self.config.x_chunk_size, len(self.x_values))
         self.x_chunk_indices = range(self.config.x_chunk_start, x_end)
         self.x_values_chunk = self.x_values[self.x_chunk_indices]
-        self.n_stellar_range_chunk = self.n_stellar_range[self.x_chunk_indices]
 
         if self.rank == 0:
             print(f"Processing x values chunk: indices {self.config.x_chunk_start} to {x_end - 1}")
             print(f"X values in chunk: {self.x_values_chunk}")
             print(f"Total x values in full grid: {len(self.x_values)}")
+
+    def _validate_contra_grids(self):
+        """Check every non-zero grid nu has a trained contra grid up front."""
+        missing = [
+            nu for nu in self.nu_values
+            if nu != 0.0 and nu not in self.contra_grids
+        ]
+        if missing:
+            raise ValueError(
+                f"Contra grids missing for nu values: {missing}. "
+                f"Available grids: {sorted(self.contra_grids.keys())}. "
+                f"Train grids for the exact linspace used here, or key the "
+                f"grid dict on values rounded to a fixed precision."
+            )
+
+    def _global_grid_key(self, global_i_x: int, i_nu: int,
+                         i_alpha: int, i_scatter: int):
+        """Chunk-layout-invariant PRNG key for one grid point."""
+        cfg = self.config
+        flat_index = (
+            ((global_i_x * cfg.n_nu + i_nu) * cfg.n_alpha + i_alpha)
+            * cfg.n_scatter + i_scatter
+        )
+        return random.fold_in(self.base_key, flat_index)
 
     def _select_halos(self, halo_catalog: np.ndarray, x: float) -> np.ndarray:
         """Select halos based on the cutoff fit for a given x value."""
@@ -212,20 +247,22 @@ class SparcLikelihoodGrid:
 
     def _generate_output_filename(self) -> str:
         """Generate output filename based on configuration (incl. chunk range)."""
-        x_chunk_end = min(self.config.x_chunk_start + self.config.x_chunk_size - 1,
+        cfg = self.config
+        x_chunk_end = min(cfg.x_chunk_start + cfg.x_chunk_size - 1,
                           len(self.x_values) - 1)
 
         base_name = (
             f'likelihood_grid_'
-            f'{self.config.n_am_reals}am_{self.n_stellar_reals_postselection}stellar_'
+            f'{cfg.n_am_reals}am_{self.n_stellar_reals_postselection}postsel_'
+            f'shape_{cfg.n_alpha}x{cfg.n_scatter}x{cfg.n_x}x{cfg.n_nu}_'
             f'alphaproxy_{np.min(self.alpha_proxy_values):.3f}_{np.max(self.alpha_proxy_values):.3f}_'
             f'scatter_{np.min(self.scatter_values):.3f}_{np.max(self.scatter_values):.3f}_'
             f'x_{np.min(self.x_values):.3f}_{np.max(self.x_values):.3f}_'
-            f'xchunk_{self.config.x_chunk_start}to{x_chunk_end}_'
+            f'xchunk_{cfg.x_chunk_start}to{x_chunk_end}_'
             f'nu_{np.min(self.nu_values):.3f}_{np.max(self.nu_values):.3f}'
         )
 
-        if self.config.vmax_shift_mode:
+        if cfg.vmax_shift_mode:
             base_name += '_vmaxshift'
 
         return f"{base_name}.npy"
@@ -241,10 +278,18 @@ class SparcLikelihoodGrid:
     def _print_computation_info(self):
         """Print information about the computation setup."""
         print(f"Number of processes: {self.size}")
-        print(f"\nNumber of AM realizations: {self.config.n_am_reals}")
-        print(f"Number of stellar mass realizations (after selection): "
+        print(f"\nBase number of AM realizations: {self.config.n_am_reals}")
+        print(f"Target post-selection stellar samples per AM realization: "
               f"{self.n_stellar_reals_postselection}")
-        print(f"\nRunning a grid of alpha proxies from {np.min(self.alpha_proxy_values):.3f} "
+        print(f"Raw stellar draws per call across x grid: "
+              f"{np.min(self.n_stellar_range)} to {np.max(self.n_stellar_range)} "
+              f"(cap {self.config.n_stellar_max_per_call})")
+        print(f"Effective AM realizations across x grid: "
+              f"{np.min(self.n_am_range)} to {np.max(self.n_am_range)}")
+        print(f"\nGrid shape (alpha, scatter, x, nu): "
+              f"({self.config.n_alpha}, {self.config.n_scatter}, "
+              f"{self.config.n_x}, {self.config.n_nu})")
+        print(f"Running a grid of alpha proxies from {np.min(self.alpha_proxy_values):.3f} "
               f"to {np.max(self.alpha_proxy_values):.3f},")
         print(f"scatters from {np.min(self.scatter_values):.3f} to {np.max(self.scatter_values):.3f},")
         print(f"x values from {np.min(self.x_values_chunk):.3f} to {np.max(self.x_values_chunk):.3f} "
@@ -312,7 +357,8 @@ class SparcLikelihoodGrid:
             for local_i_x, global_i_x in enumerate(self.x_chunk_indices):
                 x = self.x_values[global_i_x]
                 halos_selected = self._select_halos(halo_catalog, x)
-                n_stellar = self.n_stellar_range[global_i_x]
+                n_stellar = int(self.n_stellar_range[global_i_x])
+                n_am = int(self.n_am_range[global_i_x])
                 _, _, halos_selected_data = self._preprocess_data_for_jax(
                     galaxy_data, mass_model_data, halos_selected
                 )
@@ -323,13 +369,15 @@ class SparcLikelihoodGrid:
                     for i_alpha, alpha in enumerate(self.alpha_values):
                         for i_scatter, scatter in enumerate(self.scatter_values):
                             try:
-                                self.master_key, likelihood_key = random.split(self.master_key)
+                                likelihood_key = self._global_grid_key(
+                                    global_i_x, i_nu, i_alpha, i_scatter
+                                )
 
                                 likelihoods = compute_likelihood(
                                     likelihood_key, alpha, scatter, nu, abundance_match, contra_interpolator,
                                     galaxy_data, mass_model_data, halos_selected,
-                                    halos_selected_data, log_V_targets, log_V_targets_err, 
-                                    self.config.n_am_reals, n_stellar,
+                                    halos_selected_data, log_V_targets, log_V_targets_err,
+                                    n_am, n_stellar,
                                     self.size, self.rank, self.comm
                                 )
 
@@ -375,11 +423,20 @@ def main():
     # Configure parameters here - edit as needed
     config = SparcGridConfig(
         n_am_reals=100,
-        n_stellar_reals=10000,
-        grid_size=20,
+        n_postselection_target=100,
+        n_stellar_max_per_call=5000,
+
+        # Selection-model grid axes
+        alpha_proxy_range=(-np.pi / 2 + 0.01, np.pi / 2 - 0.01),
+        n_alpha=15,
+        scatter_range=(0.01, 0.8),
+        n_scatter=15,
+        x_range=(0.5, 0.96),
+        n_x=20,
+        nu_range=(-0.8, 1.6),
+        n_nu=25,
 
         # Chunking parameters - process first 5 x values (indices 0-4).
-        # Change x_chunk_start to 5, 10, 15 for the other jobs.
         x_chunk_size=5,
         x_chunk_start=0,
 
