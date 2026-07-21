@@ -1,0 +1,32 @@
+{
+  "tag": "3param_baseline",
+  "model": "baseline",
+  "grid_file": "likelihood_grid_baseline_x0_100am_100stellar_shape_42x26x31_alphaproxy_-1.561_-1.350_scatter_0.010_1.000_nu_-3.000_0.000.npy",
+  "param_order": [
+    "alpha",
+    "scatter",
+    "nu"
+  ],
+  "priors": {
+    "alpha": [
+      -1.5607963267948965,
+      1.5607963267948965
+    ],
+    "scatter": [
+      0.0,
+      1.0
+    ],
+    "nu": [
+      -3.0,
+      3.0
+    ]
+  },
+  "V_full": 18.729555921538758,
+  "ln_prior_const": -2.930102806700217,
+  "filler": -1000000.0,
+  "ln_z": 156.78338623046875,
+  "ln_z_err": [
+    -0.0018904210301116109,
+    0.001894001616165042
+  ]
+}

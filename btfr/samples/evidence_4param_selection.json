@@ -1,0 +1,37 @@
+{
+  "tag": "4param_selection",
+  "model": "selection",
+  "grid_file": "likelihood_grid_100am_100postsel_shape_15x15x20x25_alphaproxy_-1.561_1.561_scatter_0.010_0.800_x_0.500_0.960_nu_-0.800_1.600.npy",
+  "param_order": [
+    "alpha",
+    "scatter",
+    "x",
+    "nu"
+  ],
+  "priors": {
+    "alpha": [
+      -1.5607963267948965,
+      1.5607963267948965
+    ],
+    "scatter": [
+      0.0,
+      1.0
+    ],
+    "x": [
+      0.01,
+      0.99
+    ],
+    "nu": [
+      -3.0,
+      3.0
+    ]
+  },
+  "V_full": 18.354964803107983,
+  "ln_prior_const": -2.9099000993826976,
+  "filler": -1000000.0,
+  "ln_z": 178.0330352783203,
+  "ln_z_err": [
+    -0.0029243347235023975,
+    0.002932911505922675
+  ]
+}

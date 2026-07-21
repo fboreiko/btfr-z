@@ -30,7 +30,10 @@ from contra_core import contract
 N_SAMPLES = 30
 # Focus the likelihood-grid computation on the region where the
 # posterior resides.
-nu_values = np.linspace(-1.0, 1.5, 40)
+#nu_values = np.linspace(-0.8, 1.6, 25) #selection model
+#nu_values = np.linspace(-3.0, 0.0, 31) #baseline model
+nu_values = np.array([-1.43, 0.48]) #peaks of posteriors
+
  
 log_rf_values = np.linspace(-4.8, 0.3, N_SAMPLES)
 log_c_values = np.linspace(0.0, 3.9, N_SAMPLES)

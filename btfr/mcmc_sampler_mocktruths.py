@@ -1,3 +1,9 @@
+"""
+Script for the mock truths test to run MCMC sampling on a set of likelihood grids, 
+handle NaN values, and generate corner plots and trace plots for each grid. 
+"""
+
+
 import numpy as np
 from scipy.interpolate import RegularGridInterpolator
 import emcee

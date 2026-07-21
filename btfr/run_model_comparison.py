@@ -621,23 +621,22 @@ def main():
         n_am_reals=100,
         n_stellar_reals=1000,
         model_1=ModelPointConfig(
-            alpha_proxy=0.5,
-            scatter=0.1,
+            alpha_proxy=-np.pi/2 + 0.01,
+            scatter=0.01,
             x=0.0,
-            nu=float(np.linspace(-3.0, 3.0, 20)[11]),
+            nu=-1.43,
         ),
         model_2=ModelPointConfig(
-            alpha_proxy=0.5,
-            scatter=0.1,
-            x=0.0,
-            nu=float(np.linspace(-3.0, 3.0, 20)[15]),
+            alpha_proxy=0.223,
+            scatter=0.12,
+            x=0.86,
+            nu=0.48,
         ),
         base_seed=42,
         vmax_shift_mode=False,
         use_tex=True,
         output_dir="/Users/fedorboreiko/Documents/Oxford/btfr_z/plots",
         save_results=True,
-        # Matches the hard-coded results_dir in paper_btfr_panel.py.
         results_dir="/Users/fedorboreiko/Documents/Oxford/btfr_z/btfr_panel_results",
     )
 

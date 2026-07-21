@@ -1,3 +1,8 @@
+"""
+Script to generate a panel of plots for the BTFR paper.
+"""
+
+
 import sys
 import os
 sys.path.append('/Users/fedorboreiko/Documents/Oxford/btfr_z')
@@ -150,7 +155,6 @@ def main():
     log_likelihood_1 = model_1_data['log_likelihood']
     log_likelihoods_1 = model_1_data['log_likelihoods']
     params_1 = model_1_data['params']
-    params_1["nu"] = -1.12
     
     # Extract data from Model 2
     V_mock_2 = model_2_data['V_mock']
