@@ -29,7 +29,7 @@ Tabular_data/               SPARC-derived tables, mass models, convergence tests
 plots/                      Output figures, including plots/paper_plots/
 ```
 
-## The two emulators, and why order matters
+## The two emulators
 
 The pipeline is built on **two** precomputed emulators, and they must be built in order:
 
